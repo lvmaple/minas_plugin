@@ -12,3 +12,6 @@ xiaomi-nas-plugin-pcbackup/tools/dev_data*/
 
 # 含真实设备信息的本地部署记录
 小米NAS插件-真机部署实测.md
+
+# 本机 NAS 部署连接配置（参考 deploy-config.example.json）
+/deploy-config.json

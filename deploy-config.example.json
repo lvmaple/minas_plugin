@@ -1,0 +1,8 @@
+{
+  "host": "",
+  "uid": "",
+  "ssh_key": "",
+  "user": "root",
+  "port": 22,
+  "transport": "auto"
+}
