@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="zh-CN" id="root_html">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>PC 备份</title>
+  <link rel="stylesheet" href="style.css?v=1.5.7">
+</head>
+<body id="root_body">
+<div id="scroll-wrap">
+
+  <header class="top">
+    <div class="brand">
+      <div class="logo">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="2" y="4" width="20" height="16" rx="4" stroke="#fff" stroke-width="2"/>
+          <path d="M12 16V9m0 0l-3 3m3-3l3 3" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div>
+        <h1>PC 备份</h1>
+        <p class="sub">pcbackup · 电脑目录增量备份到 NAS</p>
+      </div>
+    </div>
+    <span class="conn" id="connTag"><i class="dot ok"></i><span id="connText">已连接</span></span>
+  </header>
+
+  <main>
+
+    <!-- ── 任务列表 ─────────────────────────────── -->
+    <section id="view-jobs">
+      <div class="card pad actions-bar">
+        <div>
+          <p class="label">备份任务</p>
+          <p class="meta muted">每个任务绑定一个电脑目录和一个 NAS 存放目录</p>
+        </div>
+        <button class="btn primary" id="btnNewJob" type="button">＋ 新建任务</button>
+      </div>
+      <div id="jobList" class="job-grid"><p class="empty">加载中…</p></div>
+    </section>
+
+    <!-- ── 备份流程 ─────────────────────────────── -->
+    <section id="view-backup" hidden>
+      <div class="card pad flow-head">
+        <button class="btn ghost" id="btnBackJobs" type="button">‹ 返回</button>
+        <div class="flow-title">
+          <h2 id="bkJobName">—</h2>
+          <p class="meta muted" id="bkJobDest">—</p>
+        </div>
+      </div>
+
+      <div class="card pad" id="stepResume" hidden>
+        <div class="section-head"><h2>继续上次备份</h2><span class="pill warn">未完成</span></div>
+        <p class="meta" id="resumeSummary">正在读取上次备份进度…</p>
+        <p class="meta muted resume-path" id="resumePath"></p>
+        <p class="meta muted" id="resumeHint"></p>
+        <div class="btn-row">
+          <button class="btn primary" id="btnResume" type="button">继续上次备份</button>
+          <button class="btn" id="btnResumeFresh" type="button">重新扫描目录</button>
+        </div>
+      </div>
+
+      <!-- 第 1 步：选择目录 -->
+      <div class="card pad" id="stepPick">
+        <div class="section-head"><h2>1 · 选择电脑目录</h2><span class="pill" id="pickCount">未选择</span></div>
+        <div class="np-entry" id="nativePickRow">
+          <input id="npPickPath" placeholder="或输入 PC 目录绝对路径：D:\work">
+          <button class="btn" id="btnNativeBrowse" type="button">浏览…</button>
+          <button class="btn primary" id="btnNativeConfirm" type="button">确认</button>
+        </div>
+        <div class="dropzone" id="dropzone">
+          <svg width="40" height="40" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+            <path d="M3 7a2 2 0 012-2h4l2 2h8a2 2 0 012 2v8a2 2 0 01-2 2H5a2 2 0 01-2-2V7z" stroke="#ff6900" stroke-width="1.6"/>
+            <path d="M12 16v-5m0 0l-2.5 2.5M12 11l2.5 2.5" stroke="#ff6900" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/>
+          </svg>
+          <p><strong>点击选择文件夹</strong>，或把文件夹拖到这里</p>
+          <p class="meta muted" id="npPickHint">选择文件夹即开始比对</p>
+        </div>
+        <input type="file" id="dirInput" webkitdirectory directory multiple hidden>
+        <div class="pick-status" id="pickStatus" hidden>
+          <span class="spinner"></span>
+          <span id="pickStatusText">…</span>
+        </div>
+        <div class="pick-info" id="pickInfo" hidden>
+          <p><span class="label">已选择：</span><strong id="pickFolder">—</strong></p>
+          <p class="meta" id="pickMeta">—</p>
+        </div>
+        <p class="meta muted" id="pickExclude"></p>
+      </div>
+
+      <!-- 第 2 步：增量比对 -->
+      <div class="card pad" id="stepPlan" hidden>
+        <div class="section-head"><h2>2 · 增量比对</h2><span class="pill" id="planTotal">—</span></div>
+        <div class="pill-group" id="planPills"></div>
+        <details class="file-list" id="planUploadList">
+          <summary>将上传的文件</summary><div class="list-body"></div>
+        </details>
+        <details class="file-list danger" id="planDelList">
+          <summary>PC 上已删除、待处理的文件</summary><div class="list-body"></div>
+        </details>
+        <div class="excluded-box" id="excludedRow" hidden>
+          <span>有 <b id="excludedCount">0</b> 个已备份文件因排除规则移出管理，NAS 上仍保留着</span>
+          <label class="check"><input type="checkbox" id="chkPruneExcluded">
+            <span class="danger-text">彻底删除这些文件</span></label>
+          <p class="meta danger-text" id="pruneWarn" hidden>⚠ NAS 上这 N 个文件将被永久删除（不可恢复）</p>
+        </div>
+        <div class="del-mode" id="delConfirmRow" hidden>
+          <span class="label">PC 上已删除的文件，在 NAS 端如何处理：</span>
+          <label class="check"><input type="radio" name="delMode" value="del" checked>
+            <span>改名为 <code>.del</code>（保留数据，可恢复）</span></label>
+          <label class="check"><input type="radio" name="delMode" value="delete">
+            <span class="danger-text">直接删除（不可恢复）</span></label>
+        </div>
+        <label class="check" id="forceRow" hidden>
+          <input type="checkbox" id="chkForce">
+          <span class="danger-text" id="forceText">我确认目录选择无误，强制执行删除标记</span>
+        </label>
+        <div class="btn-row">
+          <button class="btn primary" id="btnRun" type="button">开始备份</button>
+          <button class="btn" id="btnRepick" type="button">重新选择目录</button>
+        </div>
+      </div>
+
+      <!-- 第 3 步：传输 -->
+      <div class="card pad" id="stepRun" hidden>
+        <div class="section-head"><h2>3 · 传输中</h2><span class="pill" id="runPhase">准备…</span></div>
+        <div class="bar big"><i id="runBar"></i></div>
+        <p class="meta" id="runStats">—</p>
+        <p class="meta ellipsis" id="runFile">—</p>
+        <div class="log-box" id="runLog"></div>
+        <div class="btn-row">
+          <button class="btn danger-ghost" id="btnCancel" type="button">取消</button>
+        </div>
+      </div>
+
+      <!-- 第 4 步：结果 -->
+      <div class="card pad" id="stepDone" hidden>
+        <div class="section-head"><h2>4 · 备份结果</h2><span class="pill" id="doneTag">—</span></div>
+        <div class="pill-group" id="donePills"></div>
+        <p class="meta" id="doneFailed" hidden></p>
+        <div class="btn-row">
+          <button class="btn primary" id="btnDoneBack" type="button">返回任务列表</button>
+          <button class="btn" id="btnDoneAgain" type="button">再备份一次</button>
+        </div>
+      </div>
+    </section>
+
+    <!-- ── 历史 ─────────────────────────────────── -->
+    <section id="view-history" hidden>
+      <div class="card pad flow-head">
+        <button class="btn ghost" id="btnBackFromHistory" type="button">‹ 返回</button>
+        <div class="flow-title"><h2>备份历史</h2><p class="meta muted" id="histJobName">—</p></div>
+      </div>
+      <div class="card"><div id="histBody"><p class="empty">加载中…</p></div></div>
+    </section>
+
+    <!-- ── 文件浏览 ─────────────────────────────── -->
+    <section id="view-browse" hidden>
+      <div class="card pad flow-head">
+        <button class="btn ghost" id="btnBackFromBrowse" type="button">‹ 返回</button>
+        <div class="flow-title"><h2>备份文件</h2><p class="meta muted" id="brJobName">—</p></div>
+      </div>
+      <div class="card">
+        <div class="crumbs" id="brCrumbs"></div>
+        <div id="brBody"><p class="empty">加载中…</p></div>
+      </div>
+    </section>
+
+  </main>
+
+  <footer class="foot meta muted">
+    增量规则：新增上传 · 变更覆盖 · 未变跳过 · PC 已删除 → 可选改名 .del 或直接删除
+  </footer>
+</div>
+
+<!-- 任务编辑弹窗 -->
+<div class="modal-mask" id="jobModal" hidden>
+  <div class="modal">
+    <h2 id="jobModalTitle">新建任务</h2>
+    <label class="field"><span>任务名称</span><input id="fJobName" placeholder="如：我的文档"></label>
+    <label class="field"><span>备份到「我的数据」下的子目录</span><input id="fJobSub" placeholder="pcbackup/我的文档"></label>
+    <p class="meta muted">完整路径：<span id="fJobDestPreview" class="mono">—</span></p>
+    <label class="field"><span>排除规则（每行一个，支持 * 通配，目录以 / 结尾）</span>
+      <textarea id="fJobExclude" rows="8"></textarea></label>
+    <p class="meta muted">PC 目录在「开始备份」页选择；任务会记住上次使用的目录</p>
+    <div class="btn-row">
+      <button class="btn primary" id="btnJobSave" type="button">保存</button>
+      <button class="btn" id="btnJobCancel" type="button">取消</button>
+    </div>
+  </div>
+</div>
+
+<!-- 确认弹窗（folder_mismatch 等） -->
+<div class="modal-mask" id="askModal" hidden>
+  <div class="modal">
+    <h2 id="askTitle">确认</h2>
+    <p class="meta" id="askText">—</p>
+    <div class="btn-row">
+      <button class="btn primary" id="askOk" type="button">确认</button>
+      <button class="btn" id="askNo" type="button">取消</button>
+    </div>
+  </div>
+</div>
+
+<div id="toasts"></div>
+<script src="app.js?v=1.5.3"></script>
+</body>
+</html>

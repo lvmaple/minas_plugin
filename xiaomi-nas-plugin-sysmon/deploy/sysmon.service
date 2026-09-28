@@ -1,0 +1,16 @@
+[Unit]
+Description=sysmon service
+After=network.target
+
+[Service]
+Type=simple
+# 将 <uid> 替换为实际用户 UID；路径按实际部署位置调整
+ExecStart=/usr/bin/python3 /nas/pool0/u<uid>/plugin/pluginsrc/sysmon/files/httpd.py
+Restart=on-failure
+RestartSec=5
+Environment=PLUG_PORT=9301
+StandardOutput=append:/tmp/sysmon/server.log
+StandardError=append:/tmp/sysmon/server.log
+
+[Install]
+WantedBy=multi-user.target

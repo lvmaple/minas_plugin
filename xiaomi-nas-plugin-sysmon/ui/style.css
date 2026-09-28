@@ -1,0 +1,293 @@
+/* sysmon — 小米橙主题仪表盘 */
+:root {
+  --bg: #f7f3ee;
+  --card: #ffffff;
+  --ink: #1f2328;
+  --muted: #8a8f98;
+  --accent: #ff6900;          /* 小米橙 */
+  --accent-deep: #e85d00;
+  --accent-soft: rgba(255, 105, 0, .12);
+  --accent-2: #22c55e;
+  --warn: #f59e0b;
+  --danger: #ef4444;
+  --bar-bg: #efe7dc;
+  --ring-track: #f0e6d8;
+  --border: rgba(255, 105, 0, .12);
+  --shadow: 0 2px 12px rgba(255, 105, 0, .08);
+  --radius: 16px;
+}
+
+* { box-sizing: border-box; margin: 0; padding: 0; }
+
+/* 内层滚动模式：body 锁高，滚动交给 #scroll-wrap（规范文档官方推荐） */
+html, body { height: 100%; overflow: hidden; }
+
+body {
+  font-family: -apple-system, "PingFang SC", "Microsoft YaHei", "Segoe UI", sans-serif;
+  color: var(--ink);
+  -webkit-font-smoothing: antialiased;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, rgba(255, 105, 0, .10), transparent 60%),
+    var(--bg);
+}
+
+#scroll-wrap {
+  height: 100%;
+  overflow-y: auto;
+  overflow-x: hidden;
+  -webkit-overflow-scrolling: touch;
+  overscroll-behavior: contain;
+  padding: 16px 14px 32px;
+  background:
+    radial-gradient(1200px 500px at 10% -10%, rgba(255, 105, 0, .10), transparent 60%),
+    var(--bg);
+}
+
+
+
+/* ── 顶栏 ─────────────────────────────── */
+.top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  max-width: 760px;
+  margin: 0 auto 18px;
+}
+
+.brand { display: flex; align-items: center; gap: 12px; }
+
+.logo {
+  width: 44px; height: 44px;
+  border-radius: 14px;
+  background: linear-gradient(135deg, var(--accent), var(--accent-deep));
+  display: grid; place-items: center;
+  box-shadow: 0 4px 14px rgba(255, 105, 0, .35);
+}
+
+h1 { font-size: 21px; font-weight: 700; letter-spacing: .2px; }
+.sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+
+.btn {
+  border: none; cursor: pointer;
+  background: var(--accent); color: #fff;
+  padding: 10px 18px; border-radius: 12px;
+  font-size: 13px; font-weight: 600;
+  box-shadow: 0 3px 12px rgba(255, 105, 0, .3);
+  transition: background .15s, transform .12s;
+}
+.btn:hover { background: var(--accent-deep); }
+.btn:active { transform: scale(.96); }
+
+/* ── 布局 ─────────────────────────────── */
+main { max-width: 760px; margin: 0 auto; display: grid; grid-template-columns: minmax(0, 1fr); gap: 14px; }
+
+.card {
+  background: var(--card);
+  border-radius: var(--radius);
+  padding: 18px 20px;
+  border: 1px solid var(--border);
+  box-shadow: var(--shadow);
+}
+
+/* ── hero ─────────────────────────────── */
+.hero {
+  display: flex; align-items: center; justify-content: space-between;
+  gap: 16px;
+  background: linear-gradient(135deg, var(--accent) 0%, var(--accent-deep) 100%);
+  border: none;
+  color: #fff;
+}
+.hero .label { color: rgba(255,255,255,.75); }
+.hero .meta { color: rgba(255,255,255,.82); }
+.hero .meta strong { color: #fff; }
+.hostname { font-size: 26px; font-weight: 750; letter-spacing: .3px; overflow-wrap: anywhere; }
+.hero-left .meta { overflow-wrap: anywhere; }
+
+.label {
+  color: var(--muted); font-size: 12px;
+  text-transform: uppercase; letter-spacing: .6px;
+  margin-bottom: 6px;
+}
+
+.meta { color: var(--muted); font-size: 13px; margin-top: 6px; line-height: 1.5; }
+.meta strong { color: var(--ink); font-weight: 650; }
+.meta.muted { opacity: .75; font-size: 12px; }
+
+/* ── ring ─────────────────────────────── */
+.ring { position: relative; width: 120px; height: 120px; flex-shrink: 0; }
+.ring svg { transform: rotate(-90deg); }
+.ring-bg, .ring-fg {
+  fill: none; stroke-width: 10; stroke-linecap: round;
+}
+.ring-bg { stroke: rgba(255, 255, 255, .28); }
+.ring-fg {
+  stroke: #fff;
+  stroke-dasharray: 326.7;
+  stroke-dashoffset: 326.7;
+  transition: stroke-dashoffset .6s ease, stroke .3s;
+}
+.ring-label {
+  position: absolute; inset: 0;
+  display: flex; flex-direction: column;
+  align-items: center; justify-content: center;
+}
+.ring-val { font-size: 22px; font-weight: 750; }
+.ring-cap { font-size: 11px; color: rgba(255,255,255,.8); letter-spacing: 1px; }
+
+/* ── grid stats ───────────────────────── */
+.grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(200px, 1fr));
+  gap: 14px;
+}
+
+.stat .big {
+  font-size: 28px; font-weight: 750;
+  margin: 4px 0 12px;
+  color: var(--accent-deep);
+}
+.loads { display: flex; align-items: baseline; flex-wrap: wrap; gap: 6px; }
+.loads .sep { color: var(--muted); font-size: 18px; font-weight: 400; }
+
+@media (min-width: 660px) {
+  .grid { grid-template-columns: minmax(0, .85fr) minmax(0, .85fr) minmax(0, 1.3fr); }
+  .stat .loads { flex-wrap: nowrap; gap: 4px; font-size: clamp(22px, 2.8vw, 28px); }
+}
+
+@media (min-width: 480px) and (max-width: 659px) {
+  .grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+  .grid .stat:last-child { grid-column: 1 / -1; }
+}
+
+.bar {
+  height: 8px; border-radius: 99px;
+  background: var(--bar-bg); overflow: hidden;
+  margin-bottom: 10px;
+}
+.bar i {
+  display: block; height: 100%;
+  border-radius: 99px;
+  background: linear-gradient(90deg, var(--accent), var(--accent-deep));
+  width: 0%;
+  transition: width .5s ease, background .3s;
+}
+
+/* ── section ──────────────────────────── */
+.section-head {
+  display: flex; align-items: center; justify-content: space-between;
+  margin-bottom: 14px;
+}
+.section-head h2 {
+  font-size: 15px; font-weight: 700;
+  position: relative; padding-left: 12px;
+}
+.section-head h2::before {
+  content: "";
+  position: absolute; left: 0; top: 50%;
+  transform: translateY(-50%);
+  width: 4px; height: 16px; border-radius: 2px;
+  background: var(--accent);
+}
+
+.pill {
+  font-size: 12px; font-weight: 600;
+  background: var(--accent-soft); color: var(--accent-deep);
+  padding: 3px 10px; border-radius: 99px;
+}
+.pill-group { display: flex; gap: 8px; }
+.pill.ok   { background: rgba(34, 197, 94, .15);  color: #16a34a; }
+.pill.warn { background: rgba(245, 158, 11, .15); color: #d97706; }
+
+/* ── chips (temp / fan) ───────────────── */
+.chip-list {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 10px;
+}
+
+.chip {
+  background: var(--accent-soft);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  padding: 12px 14px;
+}
+.chip-name {
+  font-size: 12px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.chip-val {
+  font-size: 22px; font-weight: 750;
+  color: var(--accent-deep);
+  margin-top: 4px;
+}
+.chip-val .unit {
+  font-size: 12px; font-weight: 600;
+  color: var(--muted); margin-left: 3px;
+}
+.chip.hot .chip-val { color: var(--danger); }
+.chip.hot { background: rgba(239, 68, 68, .1); border-color: rgba(239, 68, 68, .25); }
+
+/* ── 断电保护电源 ──────────────────────── */
+.ups-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 220px), 1fr));
+  gap: 10px;
+}
+.ups-item {
+  min-width: 0;
+  padding: 12px 14px;
+  border-radius: 12px;
+  background: var(--accent-soft);
+}
+.ups-value {
+  font-size: 20px;
+  font-weight: 700;
+  overflow-wrap: anywhere;
+}
+.ups-value.alert { color: var(--danger); }
+.pill.alert { background: rgba(239, 68, 68, .12); color: var(--danger); }
+
+/* ── docker ───────────────────────────── */
+.docker-row {
+  display: flex; align-items: center; gap: 12px;
+  padding: 11px 4px;
+  border-bottom: 1px solid var(--bar-bg);
+}
+.docker-row:last-child { border-bottom: none; }
+
+.dot {
+  width: 9px; height: 9px; border-radius: 50%;
+  flex-shrink: 0;
+}
+.dot.running { background: var(--accent-2); box-shadow: 0 0 0 3px rgba(34,197,94,.18); }
+.dot.exited  { background: var(--muted); }
+.dot.other   { background: var(--warn); }
+
+.docker-main { flex: 1; min-width: 0; }
+.docker-name {
+  font-size: 14px; font-weight: 650;
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.docker-sub {
+  font-size: 12px; color: var(--muted);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+  margin-top: 2px;
+}
+.docker-status {
+  font-size: 12px; color: var(--muted);
+  white-space: nowrap;
+}
+
+.empty {
+  color: var(--muted); font-size: 13px;
+  padding: 8px 0;
+  overflow-wrap: anywhere;
+}
+
+.footer-card { text-align: center; padding: 14px 18px; }
+.footer-card .meta { margin-top: 4px; }
+
+@media (max-width: 480px) {
+  .hero { flex-direction: column; align-items: flex-start; }
+  .hero-right { align-self: center; }
+}

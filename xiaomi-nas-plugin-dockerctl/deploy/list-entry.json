@@ -1,0 +1,47 @@
+{
+  "dockerctl": {
+    "status": "running",
+    "install": true,
+    "upgrade": false,
+    "enable": true,
+    "changetime": 1758900000,
+    "icon": "/icon/dockerctl.icon",
+    "progress": "100",
+    "resource": {
+      "mpk": "/home/u<uid>/plugin/dockerctl/INFO",
+      "icon": "/icon/dockerctl.icon",
+      "preview": []
+    },
+    "info": {
+      "plugin": "dockerctl",
+      "name": "Docker 控制台",
+      "id": 97,
+      "version": "1.0.0",
+      "tags": ["tool"],
+      "timestamp": 1758900000,
+      "desc": "Docker 控制台：容器管理、镜像仓库、一键部署、存储卷与网络管理",
+      "developer": "minas",
+      "publisher": "minas",
+      "changelog": "1.0.0 首个版本",
+      "system": false,
+      "size": 30000,
+      "port": "9302",
+      "type": "standard",
+      "forceupgrade": false,
+      "ext": {}
+    },
+    "frontend": {
+      "title": "Docker 控制台",
+      "desc": "Docker 控制台：容器管理、镜像仓库、一键部署、存储卷与网络管理",
+      "icon": "/dockerctl.icon",
+      "type": "url",
+      "dev_type": [1, 2, 3, 4],
+      "url": [
+        { "dev_type": [1],     "url": "/index.html#/" },
+        { "dev_type": [2, 3, 4], "url": "/index.html#/" }
+      ],
+      "sortid": 40,
+      "widget": []
+    }
+  }
+}

@@ -1,0 +1,78 @@
+#!/bin/sh
+PLUGIN_NAME="dockerctl"
+# PLUG_SRC_DIR points at src/ (provided by the platform on install);
+# fall back to the in-repo / on-device layout relative to this script.
+PLUG_SRC_DIR="${PLUG_SRC_DIR:-$(cd "$(dirname "$0")/../src" && pwd)}"
+HTTPD="$PLUG_SRC_DIR/files/httpd.py"
+LOGDIR="/tmp/${PLUGIN_NAME}"
+PORT="${PLUG_PORT_ALLOC:-9302}"
+# Xiaomi NAS Docker CLI is not on PATH
+export DOCKER_BIN="${DOCKER_BIN:-/data/docker/docker}"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+if [ -z "${SKOPEO_BIN:-}" ] && [ -x "$SCRIPT_DIR/skopeo-container" ]; then
+    SKOPEO_BIN="$SCRIPT_DIR/skopeo-container"
+fi
+export SKOPEO_BIN="${SKOPEO_BIN:-skopeo}"
+
+_start() {
+    mkdir -p "$LOGDIR"
+    if [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ]; then
+        systemctl start "${PLUGIN_NAME}.service"; return $?
+    fi
+    PLUG_PORT="$PORT" DOCKER_BIN="$DOCKER_BIN" nohup python3 "$HTTPD" >>"$LOGDIR/server.log" 2>&1 &
+    echo $! > "$LOGDIR/server.pid"
+}
+
+_stop() {
+    [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ] && \
+        systemctl stop "${PLUGIN_NAME}.service" 2>/dev/null
+    [ -f "$LOGDIR/server.pid" ] && { kill "$(cat "$LOGDIR/server.pid")" 2>/dev/null; rm -f "$LOGDIR/server.pid"; }
+}
+
+case "$1" in
+    preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
+    postinstall)
+        # Redirect inside ExecStart (sh -c) instead of StandardOutput=append:,
+        # which needs systemd >= 240.
+        cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
+[Unit]
+Description=${PLUGIN_NAME} service
+After=network.target
+[Service]
+Type=simple
+ExecStart=/bin/sh -c 'exec /usr/bin/python3 ${HTTPD} >>${LOGDIR}/server.log 2>&1'
+Restart=on-failure
+RestartSec=5
+Environment=PLUG_PORT=${PORT}
+Environment=DOCKER_BIN=${DOCKER_BIN}
+Environment=SKOPEO_BIN=${SKOPEO_BIN}
+[Install]
+WantedBy=multi-user.target
+UNIT
+        systemctl daemon-reload
+        systemctl enable "${PLUGIN_NAME}.service"
+        _start; exit $? ;;
+    enable|start)  _start; exit $? ;;
+    restart)  _stop; _start; exit $? ;;
+    disable|stop)
+        [ "$PLUG_ACTION" = "uninstall" ] && {
+            systemctl disable "${PLUGIN_NAME}.service" 2>/dev/null
+            rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+            systemctl daemon-reload
+        }
+        _stop; exit 0 ;;
+    status)
+        if [ -f "$LOGDIR/server.pid" ] && kill -0 "$(cat "$LOGDIR/server.pid")" 2>/dev/null; then
+            echo "running"; exit 0
+        fi
+        systemctl is-active --quiet "${PLUGIN_NAME}.service" 2>/dev/null && { echo "running"; exit 0; }
+        echo "stopped"; exit 1 ;;
+    preuninstall)  _stop; exit 0 ;;
+    postuninstall)
+        systemctl disable "${PLUGIN_NAME}.service" 2>/dev/null
+        rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+        systemctl daemon-reload 2>/dev/null
+        rm -rf "$LOGDIR"; exit 0 ;;
+    preupgrade|postupgrade) exit 0 ;;
+    *) exit 0 ;;
+esac

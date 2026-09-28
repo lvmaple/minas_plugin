@@ -1,0 +1,62 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Motrix 下载</title>
+  <style>
+    *{box-sizing:border-box}html,body{height:100%;margin:0}body{font:14px system-ui,-apple-system,"Segoe UI",sans-serif;color:#2b2520;background:#fff8f2;overflow:hidden}
+    #scroll-wrap{height:100%;overflow-y:auto;padding:24px}main{max-width:760px;margin:auto}.hero{display:flex;align-items:center;gap:18px;margin:24px 0}.logo{width:64px;height:64px;border-radius:18px;background:#ff6900;display:grid;place-items:center;font-size:40px;font-weight:800;color:white}h1{font-size:28px;margin:0 0 5px}p{color:#6e625b;line-height:1.6}.card{background:#fff;border:1px solid #efd8c8;border-radius:16px;padding:20px;margin:16px 0}.status{display:flex;align-items:center;gap:8px}.dot{width:9px;height:9px;border-radius:50%;background:#aaa09a}.dot.ok{background:#33a66a}.dot.bad{background:#d94242}.actions{display:flex;flex-wrap:wrap;gap:10px;margin-top:18px}a.button,button{border:0;border-radius:9px;background:#c94f00;color:white;padding:11px 16px;font:inherit;font-weight:650;text-decoration:none;cursor:pointer}.secondary{background:#fff2e8!important;color:#873600!important;border:1px solid #efd8c8!important}.small{font-size:12px;color:#6e625b}code{word-break:break-all}
+    input{width:100%;padding:11px;border:1px solid #efd8c8;border-radius:9px;background:#fff;color:#2b2520;font:inherit}ul{list-style:none;margin:0;padding:0}li{padding:10px 0;border-top:1px solid #efd8c8;word-break:break-all}li:first-child{border-top:0}.task-status{color:#6e625b;font-size:12px;margin-top:3px}
+    @media(max-width:600px){#scroll-wrap{padding:16px}.hero{margin-top:10px}h1{font-size:24px}}
+  </style>
+</head>
+<body><div id="scroll-wrap"><main>
+  <div class="hero"><div class="logo">M</div><div><h1>Motrix 下载</h1><p>在 NAS 上运行的下载管理器</p></div></div>
+  <div class="card">
+    <div class="status"><span id="dot" class="dot"></span><strong id="state">正在检查服务…</strong></div>
+    <p>默认下载到 NAS 用户 data 目录下的 motrix-downloads 文件夹。需要手动选择其他目录，请使用插件首页的完整 Motrix 界面。</p>
+    <div class="actions"><button id="refresh" class="secondary" type="button">刷新状态</button></div>
+  </div>
+  <div class="card"><strong>新建下载</strong><form id="add-form" class="actions"><input id="source" type="text" placeholder="粘贴 HTTP、FTP 或磁力链接" required><button type="submit">添加任务</button></form><p id="add-result" class="small"></p></div>
+  <div class="card"><div class="status"><strong>下载任务</strong><button id="reload-tasks" class="secondary" type="button">刷新</button></div><ul id="tasks"><li>正在加载…</li></ul></div>
+  <p class="small">这是备用任务页。完整界面已设为 NAS 插件首页，直接从插件图标打开即可。</p>
+</main></div>
+<script>
+  const routeMatch = location.pathname.match(/(\/plugin\/[^/]+\/motrix)/);
+  const uidMatch = location.pathname.match(/\/plugin\/u?(\d+)\/motrix/);
+  const defaultSaveDir = uidMatch ? `/nas/pool0/u${uidMatch[1]}/data/motrix-downloads` : '/downloads';
+  const cgiUrl = (routeMatch ? routeMatch[1] : location.pathname.replace(/\/index\.html$/, '').replace(/\/$/, '')) + '/motrix.cgi';
+  async function check() {
+    const state=document.getElementById('state'),dot=document.getElementById('dot');
+    state.textContent='正在检查服务…';dot.className='dot';
+    try { const r=await fetch(cgiUrl+'?action=health',{cache:'no-store'}); const d=await r.json(); if(!d.ok) throw Error(d.message||'服务未就绪'); state.textContent='服务运行正常';dot.className='dot ok'; loadTasks(); }
+    catch(e){state.textContent='服务暂不可用：'+e.message;dot.className='dot bad';}
+  }
+  async function loadTasks(){
+    const list=document.getElementById('tasks');
+    try{
+      const r=await fetch(cgiUrl+'?action=tasks',{cache:'no-store'}),d=await r.json();
+      if(d.error)throw Error(d.error);
+      const tasks=Array.isArray(d)?d:(Array.isArray(d.tasks)?d.tasks:[]);
+      list.replaceChildren();
+      if(!tasks.length){const li=document.createElement('li');li.textContent='暂无任务';list.append(li);return;}
+      for(const task of tasks.slice(0,50)){
+        const li=document.createElement('li'),title=document.createElement('div'),sub=document.createElement('div');
+        title.textContent=task.name||task.filename||task.id||'未命名任务';
+        sub.className='task-status';sub.textContent=String(task.status||'');
+        li.append(title,sub);list.append(li);
+      }
+    }catch(e){list.replaceChildren();const li=document.createElement('li');li.textContent='读取失败：'+e.message;list.append(li);}
+  }
+  document.getElementById('reload-tasks').onclick=loadTasks;
+  document.getElementById('add-form').onsubmit=async e=>{
+    e.preventDefault();const el=document.getElementById('source'),result=document.getElementById('add-result'),url=el.value.trim();
+    const request=url.startsWith('magnet:?')?{type:'bt',payload:{kind:'magnet',uri:url},selectedFiles:[],saveDir:defaultSaveDir}:{type:'http',uris:[url],saveDir:defaultSaveDir,headers:[]};
+    result.textContent='正在添加…';
+    try{const r=await fetch(cgiUrl+'?action=add',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({args:[request]})}),d=await r.json();if(d.error||d.outcome==='invalid-source')throw Error(d.error||d.failure?.message||'链接无效');result.textContent=d.outcome==='created'?'任务已添加':`结果：${d.outcome||'已提交'}`;el.value='';loadTasks();}
+    catch(err){result.textContent='添加失败：'+err.message;}
+  };
+  document.getElementById('refresh').onclick=check;check();
+</script>
+</body></html>

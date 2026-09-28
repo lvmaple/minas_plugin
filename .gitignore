@@ -1,0 +1,14 @@
+# Python 字节码
+__pycache__/
+*.py[cod]
+
+# 打包产物（deploy 脚本生成）
+pcbackup-plugin.zip
+dockerctl-plugin.zip
+xiaomi-nas-plugin-motrix/motrix-plugin.zip
+
+# 本地测试数据（dev server / 测试套件生成）
+xiaomi-nas-plugin-pcbackup/tools/dev_data*/
+
+# 含真实设备信息的本地部署记录
+小米NAS插件-真机部署实测.md

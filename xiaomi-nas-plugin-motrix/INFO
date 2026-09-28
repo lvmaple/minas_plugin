@@ -1,0 +1,18 @@
+{
+  "plugin": "motrix",
+  "name": "Motrix 下载",
+  "id": 95,
+  "version": "0.3.27",
+  "tags": ["tool"],
+  "timestamp": 1790467200,
+  "desc": "Motrix Server 下载管理器",
+  "developer": "minas",
+  "publisher": "minas",
+  "changelog": "0.3.27 修复 NAS Docker 桥接网络缺少出站地址转换导致下载失败",
+  "system": false,
+  "size": 10000,
+  "port": "8080",
+  "type": "standard",
+  "forceupgrade": false,
+  "ext": {}
+}

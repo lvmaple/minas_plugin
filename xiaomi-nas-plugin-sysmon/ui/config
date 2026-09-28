@@ -1,0 +1,13 @@
+{
+    "title": "系统状态",
+    "desc": "查看 NAS CPU、内存、磁盘、温度、风扇与 Docker 容器状态",
+    "icon": "/sysmon.icon",
+    "type": "url",
+    "dev_type": [1, 2, 3, 4],
+    "url": [
+        { "dev_type": [1],       "url": "/index.html#/" },
+        { "dev_type": [2, 3, 4], "url": "/index.html#/" }
+    ],
+    "sortid": 30,
+    "widget": []
+}

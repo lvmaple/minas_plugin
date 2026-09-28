@@ -1,0 +1,75 @@
+#!/bin/sh
+PLUGIN_NAME="sysmon"
+HTTPD="$PLUG_SRC_DIR/files/httpd.py"
+LOGDIR="/tmp/${PLUGIN_NAME}"
+PORT="${PLUG_PORT_ALLOC:-9301}"
+
+_write_unit() {
+  cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
+[Unit]
+Description=${PLUGIN_NAME} service (system monitor)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${HTTPD}
+Restart=on-failure
+RestartSec=5
+Environment=PLUG_PORT=${PORT}
+StandardOutput=append:${LOGDIR}/server.log
+StandardError=append:${LOGDIR}/server.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable "${PLUGIN_NAME}.service" 2>/dev/null
+}
+
+_start() {
+  mkdir -p "$LOGDIR"
+  if [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ]; then
+    systemctl restart "${PLUGIN_NAME}.service"; return $?
+  fi
+  PLUG_PORT="$PORT" nohup /usr/bin/python3 "$HTTPD" >>"$LOGDIR/server.log" 2>&1 &
+  echo $! > "$LOGDIR/server.pid"
+}
+
+_stop() {
+  [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ] && \
+    systemctl stop "${PLUGIN_NAME}.service" 2>/dev/null
+  [ -f "$LOGDIR/server.pid" ] && { kill "$(cat "$LOGDIR/server.pid")" 2>/dev/null; rm -f "$LOGDIR/server.pid"; }
+}
+
+case "$1" in
+    preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
+    postinstall)
+        _write_unit
+        _start; exit $? ;;
+    enable|start)  _start; exit $? ;;
+    disable|stop)
+        [ "$PLUG_ACTION" = "uninstall" ] && {
+            systemctl disable "${PLUGIN_NAME}.service" 2>/dev/null
+            rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+            systemctl daemon-reload 2>/dev/null
+        }
+        _stop; exit 0 ;;
+    status)
+        if systemctl is-active --quiet "${PLUGIN_NAME}.service" 2>/dev/null; then
+            echo "running"; exit 0
+        fi
+        if [ -f "$LOGDIR/server.pid" ] && kill -0 "$(cat "$LOGDIR/server.pid")" 2>/dev/null; then
+            echo "running"; exit 0
+        fi
+        echo "stopped"; exit 1 ;;
+    preuninstall)  _stop; exit 0 ;;
+    postuninstall)
+        rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+        systemctl daemon-reload 2>/dev/null
+        rm -rf "$LOGDIR"; exit 0 ;;
+    preupgrade)  exit 0 ;;
+    postupgrade)
+        _write_unit
+        _start; exit $? ;;
+    *) exit 0 ;;
+esac

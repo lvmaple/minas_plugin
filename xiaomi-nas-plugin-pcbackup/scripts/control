@@ -1,0 +1,89 @@
+#!/bin/sh
+# pcbackup 生命周期钩子（真机 action 名：preinstall/postinstall/enable/disable/status/...）
+PLUGIN_NAME="pcbackup"
+HTTPD="$PLUG_SRC_DIR/files/httpd.py"
+LOGDIR="/tmp/${PLUGIN_NAME}"
+PORT="${PLUG_PORT_ALLOC:-9303}"
+HOME_DIR="${PLUG_HOME_DIR:-}"
+if [ -z "$HOME_DIR" ]; then
+  if [ -z "${PLUG_USER:-}" ]; then
+    echo "PLUG_USER 或 PLUG_HOME_DIR 必须设置" >&2
+    exit 2
+  fi
+  HOME_DIR="/home/${PLUG_USER}/plugin/${PLUGIN_NAME}"
+fi
+PLUG_USER="${PLUG_USER:-$(basename "$(dirname "$(dirname "$HOME_DIR")")")}"
+DATA_DIR="${HOME_DIR}/etc"
+
+_write_unit() {
+  cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
+[Unit]
+Description=${PLUGIN_NAME} service (PC incremental backup)
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/python3 ${HTTPD}
+Restart=on-failure
+RestartSec=5
+Environment=PLUG_PORT=${PORT}
+Environment=PCBACKUP_DATA=${DATA_DIR}
+Environment=PLUG_USER=${PLUG_USER}
+StandardOutput=append:${LOGDIR}/server.log
+StandardError=append:${LOGDIR}/server.log
+
+[Install]
+WantedBy=multi-user.target
+UNIT
+  systemctl daemon-reload
+  systemctl enable "${PLUGIN_NAME}.service" 2>/dev/null
+}
+
+_start() {
+  mkdir -p "$LOGDIR" "$DATA_DIR"
+  if [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ]; then
+    systemctl restart "${PLUGIN_NAME}.service"; return $?
+  fi
+  PLUG_PORT="$PORT" PCBACKUP_DATA="$DATA_DIR" nohup /usr/bin/python3 "$HTTPD" \
+    >>"$LOGDIR/server.log" 2>&1 &
+  echo $! > "$LOGDIR/server.pid"
+}
+
+_stop() {
+  [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ] && \
+    systemctl stop "${PLUGIN_NAME}.service" 2>/dev/null
+  [ -f "$LOGDIR/server.pid" ] && { kill "$(cat "$LOGDIR/server.pid")" 2>/dev/null; rm -f "$LOGDIR/server.pid"; }
+}
+
+case "$1" in
+    preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
+    postinstall)
+        _write_unit
+        _start; exit $? ;;
+    enable|start)  _start; exit $? ;;
+    disable|stop)
+        [ "$PLUG_ACTION" = "uninstall" ] && {
+            systemctl disable "${PLUGIN_NAME}.service" 2>/dev/null
+            rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+            systemctl daemon-reload 2>/dev/null
+        }
+        _stop; exit 0 ;;
+    status)
+        if systemctl is-active --quiet "${PLUGIN_NAME}.service" 2>/dev/null; then
+            echo "running"; exit 0
+        fi
+        if [ -f "$LOGDIR/server.pid" ] && kill -0 "$(cat "$LOGDIR/server.pid")" 2>/dev/null; then
+            echo "running"; exit 0
+        fi
+        echo "stopped"; exit 1 ;;
+    preuninstall)  _stop; exit 0 ;;
+    postuninstall)
+        rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
+        systemctl daemon-reload 2>/dev/null
+        rm -rf "$LOGDIR"; exit 0 ;;
+    preupgrade)  exit 0 ;;
+    postupgrade)
+        _write_unit
+        _start; exit $? ;;
+    *) exit 0 ;;
+esac

@@ -1,0 +1,20 @@
+{
+  "plugin": "dockerctl",
+  "name": "Docker 控制台",
+  "id": 97,
+  "version": "1.0.0",
+  "tags": [
+    "tool"
+  ],
+  "timestamp": 1790431829,
+  "desc": "Docker 控制台：容器管理、镜像仓库、一键部署、存储卷与网络管理",
+  "developer": "minas",
+  "publisher": "minas",
+  "changelog": "1.0.0 完整 Docker 控制台：容器/镜像/部署/存储/网络",
+  "system": false,
+  "size": 45088,
+  "port": "9302",
+  "type": "standard",
+  "forceupgrade": false,
+  "ext": {}
+}

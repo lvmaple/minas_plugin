@@ -1,0 +1,20 @@
+#!/bin/sh
+# Run the pinned official Skopeo image without changing the Docker daemon.
+DOCKER_CLI="${DOCKER_BIN:-/data/docker/docker}"
+IMAGE="quay.io/skopeo/stable@sha256:064d2cefb512c97d5a22979599ca05b7198fd6176494a634e1f31bd6b5fbd77a"
+CONTAINER_NAME="${DOCKERCTL_CONTAINER_NAME:-dockerctl-skopeo-$$}"
+
+if [ -f /root/.docker/config.json ]; then
+    exec "$DOCKER_CLI" run --rm --pull=never --network host --name "$CONTAINER_NAME" \
+        -v /var/run/docker.sock:/var/run/docker.sock \
+        -v /root/.docker/config.json:/tmp/auth.json:ro \
+        -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy \
+        -e NO_PROXY -e no_proxy \
+        "$IMAGE" "$@"
+fi
+
+exec "$DOCKER_CLI" run --rm --pull=never --network host --name "$CONTAINER_NAME" \
+    -v /var/run/docker.sock:/var/run/docker.sock \
+    -e HTTP_PROXY -e HTTPS_PROXY -e http_proxy -e https_proxy \
+    -e NO_PROXY -e no_proxy \
+    "$IMAGE" "$@"

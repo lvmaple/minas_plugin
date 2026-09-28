@@ -1,0 +1,13 @@
+{
+    "title": "PC 备份",
+    "desc": "把电脑目录增量备份到 NAS：只上传新增/修改，未变更跳过，电脑上已删除的文件标记为 .del",
+    "icon": "/pcbackup.icon",
+    "type": "url",
+    "dev_type": [1, 2, 3, 4],
+    "url": [
+        { "dev_type": [1],       "url": "/index.html#/" },
+        { "dev_type": [2, 3, 4], "url": "/index.html#/" }
+    ],
+    "sortid": 32,
+    "widget": []
+}

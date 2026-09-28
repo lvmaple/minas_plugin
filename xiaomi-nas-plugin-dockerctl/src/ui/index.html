@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN" id="root_html">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>Docker 控制台</title>
+<link rel="stylesheet" href="style.css?v=4">
+</head>
+<body id="root_body">
+<div id="scroll-wrap">
+
+  <header class="topbar">
+    <div class="brand">
+      <div class="brand-icon">🐳</div>
+      <div>
+        <h1>Docker 控制台</h1>
+        <p class="sub" id="docker-ver">连接中…</p>
+      </div>
+    </div>
+    <button class="btn btn-ghost" id="btn-refresh" title="刷新">⟳</button>
+  </header>
+
+  <nav class="tabs" id="nav-tabs">
+    <button class="tab active" data-view="overview">概览</button>
+    <button class="tab" data-view="containers">容器</button>
+    <button class="tab" data-view="images">镜像</button>
+    <button class="tab" data-view="deploy">部署</button>
+    <button class="tab" data-view="volumes">存储</button>
+    <button class="tab" data-view="networks">网络</button>
+    <button class="tab" data-view="logs">日志</button>
+  </nav>
+
+  <!-- ======== OVERVIEW ======== -->
+  <section class="view active" id="view-overview">
+    <div class="stat-grid">
+      <div class="stat-card" id="card-running">
+        <div class="stat-num" id="stat-running">-</div>
+        <div class="stat-label">运行中</div>
+      </div>
+      <div class="stat-card" data-goto="containers">
+        <div class="stat-num" id="stat-total">-</div>
+        <div class="stat-label">容器总数</div>
+      </div>
+      <div class="stat-card" data-goto="images">
+        <div class="stat-num" id="stat-images">-</div>
+        <div class="stat-label">镜像</div>
+      </div>
+      <div class="stat-card" data-goto="volumes">
+        <div class="stat-num" id="stat-volumes">-</div>
+        <div class="stat-label">存储卷</div>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">容器状态分布</div>
+      <div class="state-bars" id="state-bars"></div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">快捷操作</div>
+      <div class="quick-actions">
+        <button class="btn btn-primary" data-goto="deploy">🚀 部署新容器</button>
+        <button class="btn btn-success" data-goto="containers">📦 管理容器</button>
+        <button class="btn btn-ghost" data-goto="images">💿 管理镜像</button>
+      </div>
+    </div>
+    <div class="panel">
+      <div class="panel-title">运行中的容器</div>
+      <div id="overview-running" class="mini-list"></div>
+    </div>
+  </section>
+
+  <!-- ======== CONTAINERS ======== -->
+  <section class="view" id="view-containers">
+    <div class="toolbar">
+      <label class="chk"><input type="checkbox" id="chk-all" checked> 显示全部</label>
+      <input type="search" id="search-box" placeholder="搜索容器名称 / 镜像…" autocomplete="off">
+    </div>
+    <div id="container-list" class="card-list"></div>
+  </section>
+
+  <!-- ======== IMAGES ======== -->
+  <section class="view" id="view-images">
+    <div class="toolbar">
+      <input type="search" id="search-img" placeholder="搜索镜像…" autocomplete="off">
+      <select id="image-sort" aria-label="镜像排序">
+        <option value="pull-desc">最近拉取</option>
+        <option value="pull-asc">最早拉取</option>
+        <option value="created">镜像创建时间</option>
+      </select>
+      <button class="btn btn-primary btn-sm" id="btn-pull-img">拉取镜像</button>
+      <button class="btn btn-ghost btn-sm" id="btn-registry-login">仓库登录</button>
+    </div>
+    <div id="pull-status" class="pull-status" style="display:none"></div>
+    <div id="image-list" class="card-list"></div>
+  </section>
+
+  <!-- ======== DEPLOY ======== -->
+  <section class="view" id="view-deploy">
+    <div class="panel">
+      <div class="panel-title">快速部署 — 表单模式</div>
+      <div class="form-grid">
+        <label><span class="label-text">镜像 <span class="req">*</span></span>
+          <select id="dep-image">
+            <option value="">请选择镜像</option>
+          </select>
+          <input type="text" id="dep-image-custom" placeholder="如 nginx:latest" style="display:none;margin-top:6px">
+        </label>
+        <label>容器名
+          <input type="text" id="dep-name" placeholder="可选，如 my-nginx">
+        </label>
+        <label>重启策略
+          <select id="dep-restart">
+            <option value="unless-stopped">unless-stopped</option>
+            <option value="always">always</option>
+            <option value="on-failure">on-failure</option>
+            <option value="no">no</option>
+          </select>
+        </label>
+        <label>网络
+          <select id="dep-network">
+            <option value="">默认（bridge）</option>
+          </select>
+        </label>
+      </div>
+
+      <div class="form-section">
+        <div class="form-section-title">端口映射</div>
+        <div id="dep-ports">
+          <div class="form-row">
+            <input type="number" placeholder="主机端口" class="p-host">
+            <span class="arrow">→</span>
+            <input type="number" placeholder="容器端口" class="p-cont">
+            <select class="p-proto"><option>tcp</option><option>udp</option></select>
+            <button class="btn btn-ghost btn-sm" onclick="this.parentElement.remove()">✕</button>
+          </div>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btn-add-port">+ 添加端口</button>
+      </div>
+
+      <div class="form-section">
+        <div class="form-section-title">目录挂载</div>
+        <div id="dep-volumes">
+          <div class="form-row">
+            <input type="text" placeholder="主机路径 /host/path" class="v-host">
+            <span class="arrow">→</span>
+            <input type="text" placeholder="容器路径 /cont/path" class="v-cont">
+            <button class="btn btn-ghost btn-sm" onclick="this.parentElement.remove()">✕</button>
+          </div>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btn-add-volume">+ 添加挂载</button>
+      </div>
+
+      <div class="form-section">
+        <div class="form-section-title">环境变量</div>
+        <div id="dep-env">
+          <div class="form-row">
+            <input type="text" placeholder="变量名" class="e-key">
+            <input type="text" placeholder="值" class="e-val">
+            <button class="btn btn-ghost btn-sm" onclick="this.parentElement.remove()">✕</button>
+          </div>
+        </div>
+        <button class="btn btn-ghost btn-sm" id="btn-add-env">+ 添加变量</button>
+      </div>
+
+      <div class="form-section">
+        <div class="form-section-title">启动命令（可选）</div>
+        <input type="text" id="dep-cmd" placeholder="覆盖默认 CMD，如 /bin/sh -c 'while true; do sleep 1; done'">
+      </div>
+
+      <div class="form-section">
+        <div class="form-section-title">额外参数（可选）</div>
+        <input type="text" id="dep-extra" placeholder="如 --privileged -h myhost">
+      </div>
+
+      <button class="btn btn-primary btn-lg" id="btn-deploy-run">🚀 部署容器</button>
+    </div>
+
+    <div class="panel">
+      <div class="panel-title">Compose 部署</div>
+      <div class="form-grid">
+        <label>项目名
+          <input type="text" id="compose-name" placeholder="如 my-stack">
+        </label>
+      </div>
+      <div class="form-grid">
+        <label class="full">docker-compose.yml
+          <textarea id="compose-yaml" rows="12" placeholder="version: '3'&#10;services:&#10;  web:&#10;    image: nginx&#10;    ports:&#10;      - '8080:80'"></textarea>
+        </label>
+      </div>
+      <button class="btn btn-primary btn-lg" id="btn-deploy-compose">🚀 部署 Compose</button>
+    </div>
+    <div class="panel">
+      <div class="panel-title">已部署的 Compose 项目</div>
+      <div id="compose-list" class="card-list">
+        <div class="empty">加载中…</div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ======== VOLUMES ======== -->
+  <section class="view" id="view-volumes">
+    <div class="toolbar">
+      <input type="search" id="search-vol" placeholder="搜索存储卷…" autocomplete="off">
+      <button class="btn btn-primary btn-sm" id="btn-create-vol">创建存储卷</button>
+    </div>
+    <div id="volume-list" class="card-list"></div>
+  </section>
+
+  <!-- ======== NETWORKS ======== -->
+  <section class="view" id="view-networks">
+    <div class="toolbar">
+      <input type="search" id="search-net" placeholder="搜索网络…" autocomplete="off">
+      <button class="btn btn-primary btn-sm" id="btn-create-net">创建网络</button>
+    </div>
+    <div id="network-list" class="card-list"></div>
+  </section>
+
+  <!-- ======== LOGS ======== -->
+  <section class="view" id="view-logs">
+    <div class="toolbar">
+      <span style="color:var(--text-2);font-size:12px;flex:1">操作记录（含失败原因，重启后仍在）</span>
+      <button class="btn btn-ghost btn-sm" id="btn-refresh-logs">刷新</button>
+      <button class="btn btn-ghost btn-sm" id="btn-clear-logs">清空</button>
+    </div>
+    <div id="log-list" class="card-list"></div>
+  </section>
+
+  <!-- ======== DRAWER (detail / logs) ======== -->
+  <div class="drawer" id="drawer">
+    <div class="drawer-backdrop" id="drawer-close"></div>
+    <div class="drawer-panel">
+      <div class="drawer-head">
+        <h2 id="drawer-title">详情</h2>
+        <button class="btn btn-ghost" id="drawer-x">✕</button>
+      </div>
+      <div class="drawer-body" id="drawer-body"></div>
+    </div>
+  </div>
+
+  <!-- ======== MODAL (prompt / confirm / pull) ======== -->
+  <div class="modal" id="modal">
+    <div class="modal-backdrop" id="modal-close"></div>
+    <div class="modal-box">
+      <div class="modal-head">
+        <h2 id="modal-title">标题</h2>
+        <button class="btn btn-ghost" id="modal-x">✕</button>
+      </div>
+      <div class="modal-body" id="modal-body"></div>
+      <div class="modal-foot" id="modal-foot"></div>
+    </div>
+  </div>
+
+  <div class="toast" id="toast"></div>
+</div>
+<script src="app.js?v=6"></script>
+</body>
+</html>

@@ -1,0 +1,15 @@
+#!/bin/sh
+DOCKER=/data/docker/docker
+NAME=motrix-server
+case "$1" in
+  preinstall|preupgrade|postupgrade) exit 0 ;;
+  postinstall|enable|start) "$DOCKER" start "$NAME" >/dev/null 2>&1 || exit 1 ;;
+  disable|stop|preuninstall) "$DOCKER" stop "$NAME" >/dev/null 2>&1 || true ;;
+  postuninstall) exit 0 ;;
+  status)
+    if [ "$("$DOCKER" inspect -f '{{.State.Running}}' "$NAME" 2>/dev/null)" = true ]; then
+      echo running; exit 0
+    fi
+    echo stopped; exit 1 ;;
+  *) exit 0 ;;
+esac

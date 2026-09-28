@@ -1,0 +1,148 @@
+<!DOCTYPE html>
+<html lang="zh-CN" id="root_html">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>系统状态</title>
+  <link rel="stylesheet" href="style.css?v=1.0.11">
+</head>
+<body id="root_body">
+  <div id="scroll-wrap">
+  <header class="top">
+    <div class="brand">
+      <div class="logo">
+        <svg width="22" height="22" viewBox="0 0 24 24" fill="none" aria-hidden="true">
+          <rect x="3" y="3" width="18" height="18" rx="5" stroke="#fff" stroke-width="2"/>
+          <path d="M8 14l2.5-5L13 12l2-3 3 5" stroke="#fff" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"/>
+        </svg>
+      </div>
+      <div>
+        <h1>系统状态</h1>
+        <p class="sub">sysmon · NAS 运行概览</p>
+      </div>
+    </div>
+    <button id="refreshBtn" class="btn" type="button">刷新</button>
+  </header>
+
+  <main>
+    <!-- 顶部概览 -->
+    <section class="hero card">
+      <div class="hero-left">
+        <p class="label">主机名</p>
+        <p class="hostname" id="hostname">—</p>
+        <p class="meta"><span id="platform">—</span></p>
+        <p class="meta">运行时长 <strong id="uptime">—</strong> · 核心 <strong id="cores">—</strong></p>
+      </div>
+      <div class="hero-right">
+        <div class="ring" id="cpuRing">
+          <svg viewBox="0 0 120 120" width="120" height="120">
+            <circle class="ring-bg" cx="60" cy="60" r="52"/>
+            <circle class="ring-fg" id="cpuArc" cx="60" cy="60" r="52"/>
+          </svg>
+          <div class="ring-label">
+            <span class="ring-val" id="cpuVal">0%</span>
+            <span class="ring-cap">CPU</span>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- 内存 / 磁盘 / 负载 -->
+    <section class="grid">
+      <article class="card stat">
+        <p class="label">内存</p>
+        <p class="big" id="memPercent">—</p>
+        <div class="bar"><i id="memBar"></i></div>
+        <p class="meta"><span id="memUsed">—</span> / <span id="memTotal">—</span></p>
+      </article>
+
+      <article class="card stat">
+        <p class="label">磁盘 /</p>
+        <p class="big" id="diskPercent">—</p>
+        <div class="bar"><i id="diskBar"></i></div>
+        <p class="meta"><span id="diskUsed">—</span> / <span id="diskTotal">—</span></p>
+      </article>
+
+      <article class="card stat">
+        <p class="label">负载 (1 / 5 / 15)</p>
+        <p class="big loads">
+          <span id="load1">—</span>
+          <span class="sep">/</span>
+          <span id="load5">—</span>
+          <span class="sep">/</span>
+          <span id="load15">—</span>
+        </p>
+        <p class="meta">数据来源：本地 sysmon 服务</p>
+      </article>
+    </section>
+
+    <!-- 温度 -->
+    <section class="card">
+      <div class="section-head">
+        <h2>温度</h2>
+        <span class="pill" id="tempCount">—</span>
+      </div>
+      <div class="chip-list" id="tempList">
+        <p class="empty">读取中…</p>
+      </div>
+    </section>
+
+    <!-- 风扇 -->
+    <section class="card">
+      <div class="section-head">
+        <h2>风扇</h2>
+        <span class="pill" id="fanCount">—</span>
+      </div>
+      <div class="chip-list" id="fanList">
+        <p class="empty">读取中…</p>
+      </div>
+    </section>
+
+    <!-- 断电保护电源 -->
+    <section class="card">
+      <div class="section-head">
+        <h2>断电保护电源</h2>
+        <span class="pill" id="upsBadge">读取中…</span>
+      </div>
+      <div class="ups-grid">
+        <div class="ups-item">
+          <p class="label">供电模式</p>
+          <p class="ups-value" id="upsState">—</p>
+        </div>
+        <div class="ups-item">
+          <p class="label">异常标志</p>
+          <p class="ups-value" id="upsHealth">—</p>
+        </div>
+        <div class="ups-item">
+          <p class="label">后备供电时长</p>
+          <p class="ups-value" id="upsDuration">—</p>
+          <p class="meta" id="upsCountdown">连续供电 5 分钟后自动关机</p>
+        </div>
+      </div>
+      <p class="meta muted">根据 NAS 固件供电模式计时；恢复适配器供电后清零。不显示 UPS 电量。</p>
+    </section>
+
+    <!-- Docker -->
+    <section class="card">
+      <div class="section-head">
+        <h2>Docker 容器</h2>
+        <div class="pill-group">
+          <span class="pill ok" id="dockerRunning">运行 —</span>
+          <span class="pill warn" id="dockerExited">停止 —</span>
+        </div>
+      </div>
+      <div id="dockerList">
+        <p class="empty">读取中…</p>
+      </div>
+    </section>
+
+    <section class="card footer-card">
+      <p class="meta" id="updatedAt">等待数据…</p>
+      <p class="meta muted">每 5 秒自动刷新 · UPS 超时关机由后台独立执行</p>
+    </section>
+  </main>
+
+  <script src="app.js?v=1.0.11"></script>
+  </div>
+</body>
+</html>

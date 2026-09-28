@@ -1,0 +1,13 @@
+{
+  "title": "Motrix 下载",
+  "desc": "Motrix Server 下载管理器",
+  "icon": "/motrix.icon",
+  "type": "url",
+  "dev_type": [1, 2, 3, 4],
+  "url": [
+    {"dev_type": [1], "url": "/index.html#/downloads/all"},
+    {"dev_type": [2, 3, 4], "url": "/index.html#/downloads/all"}
+  ],
+  "sortid": 41,
+  "widget": []
+}

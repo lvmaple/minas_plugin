@@ -1,0 +1,47 @@
+{
+  "sysmon": {
+    "status": "running",
+    "install": true,
+    "upgrade": false,
+    "enable": true,
+    "changetime": 1758900000,
+    "icon": "/icon/sysmon.icon",
+    "progress": "100",
+    "resource": {
+      "mpk": "/nas/pool0/u<uid>/plugin/pluginsrc/sysmon/INFO",
+      "icon": "/icon/sysmon.icon",
+      "preview": []
+    },
+    "info": {
+      "plugin": "sysmon",
+      "name": "系统状态",
+      "id": 98,
+      "version": "1.0.0",
+      "tags": ["tool"],
+      "timestamp": 1758900000,
+      "desc": "查看 NAS CPU、内存、磁盘、温度、风扇与 Docker 容器状态",
+      "developer": "YourName",
+      "publisher": "YourTeam",
+      "changelog": "1.0.0 首个版本：系统状态仪表盘",
+      "system": false,
+      "size": 20000,
+      "port": "9301",
+      "type": "standard",
+      "forceupgrade": false,
+      "ext": {}
+    },
+    "frontend": {
+      "title": "系统状态",
+      "desc": "查看 NAS CPU、内存、磁盘、温度、风扇与 Docker 容器状态",
+      "icon": "/sysmon.icon",
+      "type": "url",
+      "dev_type": [1, 2, 3, 4],
+      "url": {
+        "dev_type": [1, 2, 3, 4],
+        "url": "/index.html"
+      },
+      "sortid": 20,
+      "widget": []
+    }
+  }
+}

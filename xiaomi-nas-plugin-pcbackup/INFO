@@ -1,0 +1,18 @@
+{
+  "plugin": "pcbackup",
+  "name": "PC 备份",
+  "id": 96,
+  "version": "1.3.0",
+  "tags": ["backup", "tool"],
+  "timestamp": 1788100000,
+  "desc": "把电脑目录增量备份到 NAS：只上传新增/修改的文件，未变更自动跳过，电脑上已删除的文件在 NAS 端标记为 .del",
+  "developer": "YourName",
+  "publisher": "minas",
+  "changelog": "1.2.0：认领 NAS 上已存在的同名一致文件（不重传）；清单双写到备份数据目录（防固件升级丢失）",
+  "system": false,
+  "size": 40000,
+  "port": "9303",
+  "type": "standard",
+  "forceupgrade": false,
+  "ext": {}
+}
