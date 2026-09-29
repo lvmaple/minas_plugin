@@ -1,7 +1,7 @@
 # 小米 NAS 插件开发规范｜手动部署实测总结
 
 > 基于 sysinfo 自研插件 + Portainer 插件化部署真机实测整理  
-> 来源：小红书 @Jray · 2025-09-02  
+> 来源：小红书 @Jray · 2026-09-02 · [原笔记](https://xhslink.cn/o/2dZ8tvxM1SQ)<br>
 > **实战补充**：sysmon 插件在小米智能存储（<nas-hostname> / aarch64 / Python 3.12）真机部署验证，含桌面端适配  
 > ⚠️ 官方安装通道无法绕过 RSA 验签，本规范适用于**手动部署**路径  
 > ⚠️ 不同固件版本后续可能存在差异，修改 /etc、Nginx、systemd、plugincenter 配置前务必做好备份  

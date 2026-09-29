@@ -2,6 +2,7 @@
   "host": "",
   "uid": "",
   "ssh_key": "",
+  "_ssh_key_note": "ssh_key 填写 SSH 私钥文件的路径（不是私钥内容）；留空使用 SSH 默认配置",
   "user": "root",
   "port": 22,
   "transport": "auto"

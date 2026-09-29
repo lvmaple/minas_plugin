@@ -47,4 +47,4 @@ python -X utf8 .\deploy-plugins.py --select sysmon,motrix
 python -X utf8 -m unittest discover -s tests -v
 ```
 
-插件的开发与部署细节见各目录的 README，以及[插件开发规范](小米NAS插件开发规范.md)。贡献前请阅读 [Repository Guidelines](AGENTS.md)。不要提交 SSH 私钥、访问令牌、真实设备地址或本机部署配置。
+插件的开发与部署细节见各目录的 README，以及[插件开发规范](小米NAS插件开发规范.md)。该规范整理自小红书 @Jray 的[原笔记](https://xhslink.cn/o/2dZ8tvxM1SQ)（2026-09-02），并结合真机实测补充。贡献前请阅读 [Repository Guidelines](AGENTS.md)。不要提交 SSH 私钥、访问令牌、真实设备地址或本机部署配置。
