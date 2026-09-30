@@ -8,6 +8,7 @@
   "use strict";
 
   var CHUNK_SIZE = 8 * 1024 * 1024;   // 8 MiB / 块
+  var BRIDGE_MAX_FILE = 64 * 1024 * 1024;
   var RETRY_MAX = 3;
   var LOG_KEEP = 400;
   var DEFAULT_EXCLUDES = [
@@ -639,6 +640,17 @@
 
   function runUpload() {
     if (state.running || !state.plan) return;
+    if (state.sourcePath && !getPcFs()) {
+      var bridge = getBridge();
+      if (!bridge || typeof bridge.getPcFileStream !== "function") {
+        toast("桌面端无法读取 PC 文件，请点「选择文件夹」重新扫描", true);
+        return;
+      }
+      if (state.plan.upload.some(function (item) { return item[1] > BRIDGE_MAX_FILE; })) {
+        toast("原生桥接无法安全读取大文件，请点「选择文件夹」重新扫描", true);
+        return;
+      }
+    }
     if (state.sourcePath && !state.resumeRunId) {
       state.running = true;
       $("btnRun").disabled = true;
@@ -944,7 +956,7 @@
   //     一次调用递归返回整树；files[] 无 mtime
   //   getPcFileStats({filepath,tag}, cb) → cb(fs.Stats{mtimeMs,...})   ← 字段是 filepath 不是 path！
   //   getDropFilePaths([...File]) → [绝对路径]                          ← 必须喂真数组
-  //   getPcFileStream 五参签名未破解 → readPcChunk 自适应姿势
+  //   getPcFileStream(path, start, onData, onEnd, onError) → 从 start 流到 EOF
   // 所有调用按 invoke 语义防御：promise 可能先回 undefined、结果稍后走回调。
 
   function getBridge() {
@@ -1033,68 +1045,94 @@
     return null;
   }
 
-  var _streamIdx = -1;   // getPcFileStream 试出的姿势下标。
-                         // 只能缓存下标——缓存闭包会绑死首次调用的 abs/off/len（实测踩过）
-
-  // 从 PC 绝对路径读 [off, off+len) 字节 → Blob；姿势未破解时依次尝试
-  function readPcChunk(api, abs, off, len) {
-    var shapeFns = [
-      function (onData, onEnd) { return api.getPcFileStream(abs, off, len, onData, onEnd); },
-      function (onData, onEnd) { return api.getPcFileStream(abs, off, len, onData, onEnd, onEnd); },
-      function (onData, onEnd) { return api.getPcFileStream(abs, off, len, onData); },
-      function (onData, onEnd) { return api.getPcFileStream(abs, onEnd); }
-    ];
-    var order = _streamIdx >= 0 ? [_streamIdx] : [0, 1, 2, 3];
-    function attempt(i) {
-      if (i >= order.length) {
-        return Promise.reject(new Error("getPcFileStream 姿势未破解，无法读取 " + abs + "（可改用经典方式重选目录）"));
-      }
-      var si = order[i];
-      return new Promise(function (resolve, reject) {
-        var acc = [], got = 0, done = false, timer;
-        function finish(ok) {
-          if (done) return;
-          done = true;
-          clearTimeout(timer);
-          if (!ok) { reject(new Error("read fail")); return; }
-          var total = 0, j;
-          for (j = 0; j < acc.length; j++) total += acc[j].length;
-          var out = new Uint8Array(total), pos = 0;
-          for (j = 0; j < acc.length; j++) { out.set(acc[j], pos); pos += acc[j].length; }
-          resolve(new Blob([out]));
-        }
-        function onData(v) {
-          var b = toBytes(v);
-          if (b && b.length) {
-            acc.push(b);
-            got += b.length;
-            if (got >= len) finish(true);
-          } else if (v === null || v === false) {
-            finish(true);   // 结束信号
-          }
-        }
-        try {
-          var r = shapeFns[si](onData, function () { finish(true); });
-          if (r && typeof r.then === "function") {
-            r.then(function (v) {
-              if (v !== undefined) { var b = toBytes(v); if (b) { acc.push(b); finish(true); } }
-            }).catch(function () {});
-          }
-        } catch (e) { finish(false); }
-        timer = setTimeout(function () { finish(got > 0); }, 15000);
-      }).then(function (blob) {
-        _streamIdx = si;
-        return blob;
-      }, function () {
-        return attempt(i + 1);
-      });
+  var _pcFs;
+  function getPcFs() {
+    if (_pcFs !== undefined) return _pcFs;
+    var loaders = [];
+    try { if (typeof require === "function") loaders.push(require); } catch (e) {}
+    try { if (typeof window.require === "function") loaders.push(window.require); } catch (e) {}
+    try {
+      var raw = window.__MICRO_APP_WINDOW__ && window.__MICRO_APP_WINDOW__.rawWindow;
+      if (raw && typeof raw.require === "function") loaders.push(raw.require);
+    } catch (e) {}
+    for (var i = 0; i < loaders.length; i++) {
+      try {
+        var fs = loaders[i]("fs");
+        if (fs && fs.promises && typeof fs.promises.open === "function") return (_pcFs = fs);
+      } catch (e) {}
     }
-    return attempt(0);
+    return (_pcFs = null);
+  }
+
+  async function readNodeChunk(fs, abs, off, len) {
+    var handle = await fs.promises.open(abs, "r");
+    try {
+      var bytes = new Uint8Array(len), got = 0;
+      while (got < len) {
+        var result = await handle.read(bytes, got, len - got, off + got);
+        if (!result.bytesRead) break;
+        got += result.bytesRead;
+      }
+      return new Blob([bytes.subarray(0, got)]);
+    } finally {
+      await handle.close();
+    }
+  }
+
+  // 桥接接口实际为 (path, start, onData, onEnd, onError)，会一直读到 EOF。
+  // 它没有定长读取或暂停能力，故只作小文件回退，并串行调用以免全局 IPC 事件串流。
+  var _bridgeReadQueue = Promise.resolve();
+  function readBridgeChunk(api, abs, off, len, size) {
+    if (!api || typeof api.getPcFileStream !== "function") {
+      return Promise.reject(new Error("桌面端无法读取 PC 文件，请用「选择文件夹」重新扫描"));
+    }
+    if (size > BRIDGE_MAX_FILE) {
+      return Promise.reject(new Error("原生桥接读取大文件不安全，请用「选择文件夹」重新扫描"));
+    }
+    return new Promise(function (resolve, reject) {
+      var parts = [], got = 0, done = false, timer;
+      function finish(error) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        if (error) reject(error);
+        else if (got !== len) reject(new Error("读取的文件分块长度不符，请重新扫描目录"));
+        else resolve(new Blob(parts));
+      }
+      function armTimer() {
+        if (done) return;
+        clearTimeout(timer);
+        timer = setTimeout(function () { finish(new Error("读取 PC 文件超时")); }, 30000);
+      }
+      try {
+        api.getPcFileStream(abs, off, function (value) {
+          if (done) return;
+          var bytes = toBytes(value);
+          if (!bytes) { finish(new Error("桌面端返回了无法识别的文件数据")); return; }
+          var keep = Math.min(bytes.length, len - got);
+          if (keep > 0) { parts.push(bytes.subarray(0, keep)); got += keep; }
+          armTimer();
+        }, function () { finish(); }, function (error) {
+          finish(new Error("读取 PC 文件失败：" + (error && error.message || error)));
+        });
+        armTimer();
+      } catch (error) { finish(error); }
+    });
+  }
+
+  function readPcChunk(api, abs, off, len, size) {
+    var fs = getPcFs();
+    if (fs) return readNodeChunk(fs, abs, off, len);
+    var task = _bridgeReadQueue.then(function () {
+      return readBridgeChunk(api, abs, off, len, size);
+    });
+    _bridgeReadQueue = task.catch(function () {});
+    return task;
   }
 
   function readEntryChunk(ent, off, end) {
     if (ent.file) return Promise.resolve(ent.file.slice(off, end));
-    return readPcChunk(getBridge(), ent.abs, off, end - off);
+    return readPcChunk(getBridge(), ent.abs, off, end - off, ent.size);
   }
 
   // 原生读取入口：整树 → 排除过滤 → 并发补 mtime → 走既有比对流水
