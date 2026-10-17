@@ -1,6 +1,6 @@
 # 小米 NAS 插件合集
 
-本仓库包含四个小米智能存储插件，以及用于打包和部署它们的统一命令行工具。每个插件都可以独立阅读、修改和部署；首次使用建议先查看对应插件的说明。
+本仓库包含四个小米智能存储插件、用于打包和部署它们的统一命令行工具，以及一个针对固件 1.0.9.462 的 SSH 开启工具。每个插件都可以独立阅读、修改和部署；首次使用建议先查看对应插件的说明。
 
 ## 插件一览
 
@@ -11,9 +11,13 @@
 | PC 备份（`pcbackup`） | 将电脑目录增量备份到 NAS，支持断点续传 | [README](xiaomi-nas-plugin-pcbackup/README.md) |
 | 系统状态（`sysmon`） | 查看 CPU、内存、磁盘、温度、风扇和 Docker 状态 | [README](xiaomi-nas-plugin-sysmon/README.md) |
 
+## SSH 开启工具
+
+`xiaomi-nas-root-tool-1.0.9.462/` 是针对固件 1.0.9.462 的一键开启 SSH 工具（旧工具的 WebDAV 注入链已在该固件被修补，此为新链路）：mTLS 证书自动定位、凭据现场获取不落盘、触发载荷现场汇编；只获取本机会话、不做重启持久化，成功与失败路径均自动清理。详见其 [README](xiaomi-nas-root-tool-1.0.9.462/README.md) 与[技术复盘](xiaomi-nas-root-tool-1.0.9.462/技术复盘.md)。
+
 ## 快速开始
 
-本地需要 Python 3.10 或更新版本。部署需要可连接 NAS 的 SSH 环境、NAS 的 root 权限，以及米家用户的**数字 UID**（不带 `u` 前缀）。部分插件还有专属前提，例如 Motrix 需要 NAS 上已有对应 Docker 镜像，请先阅读插件说明。
+本地需要 Python 3.10 或更新版本。部署需要可连接 NAS 的通道（SSH 或 socat root shell，见[统一部署说明](DEPLOY-PLUGINS.md)）、NAS 的 root 权限，以及米家用户的**数字 UID**（不带 `u` 前缀）。部分插件还有专属前提，例如 Motrix 需要 NAS 上已有对应 Docker 镜像，请先阅读插件说明。
 
 在仓库根目录执行：
 
@@ -31,14 +35,17 @@ python -X utf8 .\deploy-plugins.py
 python -X utf8 .\deploy-plugins.py --select sysmon,motrix
 ```
 
-`deploy-config.json` 已被 Git 忽略。也可以用 `--host`、`--uid`、`--ssh-key` 等参数临时覆盖配置；运行 `python -X utf8 deploy-plugins.py --help` 查看完整选项。Windows 默认优先使用 WSL 的 SSH 工具；没有 WSL 时可将 `transport` 设为 `native`。首次连接 NAS 时，先在相同的 SSH 环境中确认主机密钥。
+`deploy-config.json` 已被 Git 忽略。也可以用 `--host`、`--uid`、`--ssh-key` 等参数临时覆盖配置；运行 `python -X utf8 deploy-plugins.py --help` 查看完整选项。
+
+部署支持两种通道：**ssh**（传统 scp+ssh）与 **socat**（root shell + WebDAV mTLS 上传，对固件 dropbear exec bug 免疫，Windows 上 `--channel auto` 默认走此通道；前置条件是 NAS 已开启 socat root shell，可用上面的 SSH 工具完成）。通道细节与配置项见[统一部署说明](DEPLOY-PLUGINS.md)。首次经 SSH 连接 NAS 时，先在相同的 SSH 环境中确认主机密钥。
 
 部署脚本会修改 NAS 的插件目录、注册信息和相关服务。只想检查连接、不上传或安装插件时，可运行 `python -X utf8 deploy-plugins.py --select none`。完整步骤见[统一部署说明](DEPLOY-PLUGINS.md)。
 
 ## 仓库结构与开发
 
 - `xiaomi-nas-plugin-*/`：插件源码、`INFO` 元数据、前端资源和各自的 `deploy/` 脚本。
-- `deploy-plugins.py`：发现、打包并部署所选插件。
+- `xiaomi-nas-root-tool-1.0.9.462/`：固件 1.0.9.462 的 SSH 开启工具（脚本、使用说明、技术复盘）。
+- `deploy-plugins.py`：发现、打包并部署所选插件（ssh / socat 双通道）。
 - `tests/`：统一部署工具的 `unittest` 测试。
 
 修改统一部署工具后，在仓库根目录运行：
