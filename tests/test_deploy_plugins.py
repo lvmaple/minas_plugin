@@ -59,7 +59,8 @@ class DeployPluginsTests(unittest.TestCase):
 
     def test_config_supplies_connection_without_prompt(self):
         args = Namespace(host=None, uid=None, ssh_key=None, user=None,
-                         port=None, transport=None)
+                         port=None, transport=None, channel=None,
+                         shell_port=None, cert_dir=None)
         config = {"host": "nas.local", "uid": "123", "ssh_key": "",
                   "user": "root", "port": 2222, "transport": "native"}
         with patch("builtins.input") as prompt:
@@ -73,11 +74,36 @@ class DeployPluginsTests(unittest.TestCase):
              patch.object(deploy, "deploy_plugin") as install:
             result = deploy.main(["--host", "nas.local", "--uid", "123",
                                   "--transport", "native", "--ssh-key=",
+                                  "--channel", "ssh",
                                   "--select", "none"])
         self.assertEqual(result, 0)
         check.assert_called_once()
         install.assert_not_called()
 
+    def test_fix_text_crlf_only_touches_text_suffixes(self):
+        with tempfile.TemporaryDirectory() as temp:
+            archive = Path(temp) / "p.zip"
+            png = b"\x89PNG\r\n\x1a\n" + bytes(range(256)) * 4  # 含 0x0D 的二进制
+            script = b"#!/bin/sh\r\nset -e\r\n"
+            info = b'{\r\n  "plugin": "x"\r\n}\r\n'
+            with zipfile.ZipFile(archive, "w") as z:
+                z.writestr("ui/icon.png", png)
+                z.writestr("deploy/deploy.sh", script)
+                z.writestr("INFO", info)
+            changed = deploy.fix_text_crlf(archive)
+            self.assertEqual(changed, 2)
+            with zipfile.ZipFile(archive) as z:
+                self.assertEqual(z.read("ui/icon.png"), png)          # 二进制原样
+                self.assertEqual(z.read("deploy/deploy.sh"), b"#!/bin/sh\nset -e\n")
+                self.assertNotIn(b"\r", z.read("INFO"))
+
+    def test_make_client_picks_socat_or_ssh(self):
+        ssh_conn = deploy.Connection("nas", "1", "root", 22, None, "native", "ssh")
+        socat_conn = deploy.Connection("nas", "1", "root", 22, None, "native", "socat")
+        self.assertIsInstance(deploy.make_client(ssh_conn), deploy.SshClient)
+        self.assertIsInstance(deploy.make_client(socat_conn), deploy.SocatClient)
+
 
 if __name__ == "__main__":
     unittest.main()
+

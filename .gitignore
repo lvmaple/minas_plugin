@@ -15,3 +15,7 @@ xiaomi-nas-plugin-pcbackup/tools/dev_data*/
 
 # 本机 NAS 部署连接配置（参考 deploy-config.example.json）
 /deploy-config.json
+
+# NAS root 研究全集：整目录不入库（内部档案含设备/凭据信息；发布物在 xiaomi-nas-root-tool-1.0.9.462/）
+/nas-root-research/
+

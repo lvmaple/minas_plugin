@@ -1,9 +1,11 @@
 {
   "host": "",
   "uid": "",
-  "ssh_key": "",
-  "_ssh_key_note": "ssh_key 填写 SSH 私钥文件的路径（不是私钥内容）；留空使用 SSH 默认配置",
+  "ssh_key": "SSH 绉侀挜鏂囦欢鐨勮矾寰勶紙涓嶆槸瀵嗛挜鍐呭锛夛紱鐣欑┖浣跨敤 SSH 榛樿閰嶇疆锛堜粎 ssh 閫氶亾锛?,
   "user": "root",
   "port": 22,
-  "transport": "auto"
+  "transport": "auto",
+  "channel": "auto",
+  "shell_port": 2323,
+  "cert_dir": ""
 }
