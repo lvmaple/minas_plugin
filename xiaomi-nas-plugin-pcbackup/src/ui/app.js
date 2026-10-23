@@ -885,8 +885,9 @@
       });
     }
     chain = chain.then(function () {
-      // 文件间并发（4 路，避开浏览器同域连接数上限），单文件内部仍按块串行
-      var CONCURRENCY = 4;
+      // 文件间并发 3 路（与桌面 App uploadConcurrentLimit=3 对齐：
+      // 4 路时其内置 P2P 代理偶发转发乱序，MOVE 早于 PUT 落盘 → ENOENT）
+      var CONCURRENCY = 3;
       var queue = plan.upload.slice();
       function worker() {
         if (state.cancel || !queue.length) return Promise.resolve();
@@ -1301,12 +1302,25 @@
             mtime: mtime || 0
           }, function (p) {
             if (onProgress) onProgress(p);
-          }, function () { fin(); }, function (e) {
+          }, function () { settled(null); }, function (e) {
             var msg = (e && e.message) || (e && e.error && e.error.message) || (e && e.code) || e;
             var detail = e && e.error ? " [" + String(e.error).slice(0, 200) + "]" : "";
-            fin(new Error("原生上传失败：" + msg + detail));
+            settled(new Error("原生上传失败：" + msg + detail));
           }, function () {});
         } catch (e) { fin(e); }
+
+        // 竞态垫片：桌面 App 在 PUT 与 rename 之间有 XXhash 校验（数百 ms 起），
+        // 我们跳过校验时 MOVE 紧贴 PUT，撞上 App 内置 P2P 代理隧道的转发乱序
+        // （真机实测 ~8% 的 MOVE 到达时源文件尚未落盘 → ENOENT 500）。
+        // PUT 完成后先向插件后端查一次该文件的 .part 状态再放行：
+        // 一个 RTT 的时间垫片（App 同款思路）+ 顺便对账。
+        // 查询失败不阻塞：垫片只是保险丝，不能成为新故障点。
+        function settled(err) {
+          var probe = err ? Promise.resolve() :
+            api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
+              .catch(function () { return null; });
+          probe.then(function () { fin(err); }, function () { fin(err); });
+        }
       });
     });
   }
