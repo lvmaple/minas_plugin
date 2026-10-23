@@ -884,6 +884,21 @@
         return tombstoneAll();
       });
     }
+    // 直传 MOVE 不建父目录（WebDAV rename 语义；桌面 App 端也无自愈——真机实测
+    // 新目录首传 100% ENOENT 500）。上传前一次性让后端预建全部目录，幂等。
+    if (state.sourcePath && !getPcFs() && plan.upload.length) {
+      chain = chain.then(function () {
+        setProgress("准备目录…", "");
+        return api("POST", "api/jobs/" + job.id + "/mkdirs",
+          { paths: plan.upload.map(function (item) { return item[0]; }) })
+          .then(function (r) {
+            if (r && r.created) log("已预建 " + r.created + " 个目录", "lg-skip");
+          })
+          .catch(function (e) {
+            log("目录预建失败（将由降级路径自建）：" + e.message, "lg-err");
+          });
+      });
+    }
     chain = chain.then(function () {
       // 文件间并发 3 路（与桌面 App uploadConcurrentLimit=3 对齐：
       // 4 路时其内置 P2P 代理偶发转发乱序，MOVE 早于 PUT 落盘 → ENOENT）

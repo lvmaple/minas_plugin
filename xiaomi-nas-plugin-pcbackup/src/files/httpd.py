@@ -829,6 +829,19 @@ def part_size(job, rel):
     return 200, {"size": os.path.getsize(part) if os.path.isfile(part) else 0}
 
 
+def mkdirs_for_job(job, rels):
+    """批量预建 rel 文件的父目录（直传 MOVE 前调用：WebDAV 的 rename 不会
+    自动建父目录，MOVE 到不存在的目录报 ENOENT 500——桌面 App 端同样没有
+    MKCOL 自愈，真机实测新目录首传 100% 失败）。幂等，已存在跳过。"""
+    made = 0
+    for rel in rels[:2000]:
+        parent = os.path.dirname(safe_join(job["destination"], rel or "x"))
+        if parent and not os.path.isdir(parent):
+            _mkdir_chowned(parent)
+            made += 1
+    return 200, {"created": made}
+
+
 def commit_file(job, rel, size, mtime):
     """.part → 正式文件：原子替换、保留修改时间、记清单。"""
     destf = safe_join(job["destination"], rel)
@@ -1316,6 +1329,13 @@ class Handler(BaseHTTPRequestHandler):
                 if job:
                     code, data = start_resume(job, self._read_json())
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "mkdirs":
+                job = self._job(parts[2]) or None
+                if job:
+                    body = self._read_json()
+                    code, data = mkdirs_for_job(job, body.get("paths", []))
+                    (self._ok if code == 200 else lambda d: self._err(code, data))(data)
 
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "commit":
                 job = self._job(parts[2]) or None
