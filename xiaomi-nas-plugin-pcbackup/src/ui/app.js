@@ -788,20 +788,33 @@
               } catch (err) {}
               clearInterval(cancelWatch);
             }, 500);
-            return uploadViaNative(job, ent, rel, size, mtime, offset, (function () {
+            var speedProbe = (function () {
               var lastSeen = offset || 0;   // 直传回调给累计值，差分后才可进速度统计
-              return function (p) {
-                if (p && typeof p.transferred === "number") {
-                  var delta = Math.max(0, p.transferred - lastSeen);
-                  lastSeen = p.transferred;
-                  tickSpeed(delta);
-                  setProgress("上传中", rel + "（" + fmtBytes(p.transferred) + "）");
+              return {
+                tick: function (p) {
+                  if (p && typeof p.transferred === "number") {
+                    var delta = Math.max(0, p.transferred - lastSeen);
+                    lastSeen = p.transferred;
+                    tickSpeed(delta);
+                    setProgress("上传中", rel + "（" + fmtBytes(p.transferred) + "）");
+                  }
+                },
+                // 主进程进度 IPC 有 1 秒节流：小文件几百毫秒传完，可能一个进度事件都
+                // 没发就 finish——速度永远显示"…"。完成时补记未上报的尾部字节。
+                settle: function () {
+                  var rest = Math.max(0, size - lastSeen);
+                  if (rest > 0) tickSpeed(rest);
                 }
               };
-            })(), uploadTag).then(function () {
-              clearInterval(cancelWatch);
-              doneBytes += size - offset;
-            }, function (err) {
+            })();
+            return uploadViaNative(job, ent, rel, size, mtime, offset,
+              function (p) { speedProbe.tick(p); }, uploadTag)
+              .then(function () {
+                clearInterval(cancelWatch);
+                speedProbe.settle();
+                doneBytes += size - offset;
+                setProgress("上传中", rel);
+              }, function (err) {
               clearInterval(cancelWatch);
               if (err && err.cancelled) throw err;
               // 直传失败降级：按块 XHR 续传。getPcFileStream 虽共用频道，但 readPcChunk
@@ -900,10 +913,10 @@
       });
     }
     chain = chain.then(function () {
-      // 文件间并发 6 路。目录预建修复后 MOVE 失败根因已消除；直传走主进程
-      // 连接池不占浏览器同域连接数，6 路实测提吞吐。若出现 PUT 超时/连接重置
-      // 再回落（App 自身限 3 是保守值，并非硬上限）。
-      var CONCURRENCY = 6;
+      // 文件间并发 10 路。目录预建修复后 MOVE 失败根因已消除；直传走主进程
+      // 连接池不占浏览器同域连接数，6 路实测稳定，试探 10 路吞吐。
+      // 若出现 PUT 超时/连接重置再回落（App 自身限 3 是保守值，并非硬上限）。
+      var CONCURRENCY = 10;
       var queue = plan.upload.slice();
       function worker() {
         if (state.cancel || !queue.length) return Promise.resolve();
