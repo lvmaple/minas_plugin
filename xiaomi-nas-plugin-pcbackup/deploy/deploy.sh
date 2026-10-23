@@ -71,10 +71,10 @@ entry = {
         "sortid": 32, "widget": []
     },
     "info": {
-        "plugin": plugin, "name": "PC 备份", "id": 96, "version": "1.3.0",
+        "plugin": plugin, "name": "PC 备份", "id": 96, "version": "1.3.6",
         "tags": ["backup", "tool"], "timestamp": int(time.time()),
         "desc": desc, "developer": "YourName", "publisher": "minas",
-        "changelog": "1.3.0 异步比对+进度+直接删除选项", "system": False, "size": 40000,
+        "changelog": "1.3.6 修复卡死/内存暴涨/取消无效", "system": False, "size": 40000,
         "port": port, "type": "standard", "forceupgrade": False, "ext": {}
     }
 }

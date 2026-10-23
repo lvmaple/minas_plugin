@@ -593,23 +593,41 @@
 
   // -- 上传执行 --
 
+  // 活跃 XHR 登记：取消时统一 abort，杜绝僵尸 PUT 在取消/失败后仍打服务端（曾把
+  // 服务端 .part 截断引发 409 连锁）
+  var _activeXhrs = [];
+  function abortAllUploads() {
+    _activeXhrs.forEach(function (x) { try { x.abort(); } catch (e) {} });
+    _activeXhrs = [];
+  }
+
   function xhrPut(url, blob, onProgress) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
+      _activeXhrs.push(xhr);
+      var settled = false;
+      function settle(fn, arg) {
+        if (settled) return;
+        settled = true;
+        var ix = _activeXhrs.indexOf(xhr);
+        if (ix >= 0) _activeXhrs.splice(ix, 1);
+        fn(arg);
+      }
       xhr.open("PUT", apiUrl(url));
       xhr.timeout = 0;
       xhr.upload.onprogress = function (ev) { if (onProgress) onProgress(ev.loaded); };
       xhr.onload = function () {
-        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        if (xhr.status >= 200 && xhr.status < 300) settle(resolve);
         else {
           var msg = "HTTP " + xhr.status;
           try { msg = JSON.parse(xhr.responseText).message || msg; } catch (e) {}
           var err = new Error(msg); err.status = xhr.status; err.resp = xhr.responseText;
-          reject(err);
+          settle(reject, err);
         }
       };
-      xhr.onerror = function () { reject(new Error("网络错误")); };
-      xhr.ontimeout = function () { reject(new Error("上传超时")); };
+      xhr.onerror = function () { settle(reject, new Error("网络错误")); };
+      xhr.ontimeout = function () { settle(reject, new Error("上传超时")); };
+      xhr.onabort = function () { settle(reject, { cancelled: true }); };
       xhr.send(blob);
     });
   }
@@ -617,8 +635,11 @@
   function withRetry(fn, label) {
     var attempt = 0;
     function tryOnce() {
+      if (state.cancel) return Promise.reject({ cancelled: true });
       return fn().catch(function (e) {
         attempt++;
+        // 409=offset_mismatch / 400=参数错：状态冲突重试无意义，直接抛
+        if (e && (e.cancelled || e.status === 409 || e.status === 400)) throw e;
         if (state.cancel || attempt >= RETRY_MAX) throw e;
         log("第 " + attempt + " 次重试 " + label + "：" + e.message, "lg-err");
         return new Promise(function (r) { setTimeout(r, 1000 * Math.pow(2, attempt)); }).then(tryOnce);
@@ -644,10 +665,6 @@
       var bridge = getBridge();
       if (!bridge || typeof bridge.getPcFileStream !== "function") {
         toast("桌面端无法读取 PC 文件，请点「选择文件夹」重新扫描", true);
-        return;
-      }
-      if (state.plan.upload.some(function (item) { return item[1] > BRIDGE_MAX_FILE; })) {
-        toast("原生桥接无法安全读取大文件，请点「选择文件夹」重新扫描", true);
         return;
       }
     }
@@ -751,17 +768,77 @@
               return xhrPut(url + 0, new Blob([]), null);
             }, rel);
           }
+          // 原生路径无 Node fs：一律 upLoadToNas 主进程直传。
+          // 不要用 getPcFileStream 流式——它的回传频道全局共用且无停止接口：
+          // 一条流失败后主进程仍继续灌数据，僵尸回调会把下一条流的数据/finish 串进来，
+          // 且失败流的 withRetry 会用旧 offset 重放 PUT，把服务端 .part 截断（409 连锁）。
+          // upLoadToNas 是 tag 隔离的（upLoadToNas_progress_<tag>），pauseUpload 可停，单写者无并发冲突。
+          if (state.sourcePath && !ent.file && !getPcFs()) {
+            var b0 = getBridge();
+            if (!b0 || typeof b0.upLoadToNas !== "function") {
+              throw new Error("桌面端缺少原生上传接口，请点「选择文件夹」用浏览器模式");
+            }
+            log("原生直传 " + fmtBytes(size) + " " + rel, "lg-skip");
+            var uploadTag = "pcb_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
+            var cancelWatch = setInterval(function () {
+              if (!state.cancel) return;
+              try {
+                var bb = getBridge();
+                if (bb && typeof bb.pauseUpload === "function") bb.pauseUpload(uploadTag, true);
+              } catch (err) {}
+              clearInterval(cancelWatch);
+            }, 500);
+            return uploadViaNative(job, ent, rel, size, mtime, offset, (function () {
+              var lastSeen = offset || 0;   // 直传回调给累计值，差分后才可进速度统计
+              return function (p) {
+                if (p && typeof p.transferred === "number") {
+                  var delta = Math.max(0, p.transferred - lastSeen);
+                  lastSeen = p.transferred;
+                  tickSpeed(delta);
+                  setProgress("上传中", rel + "（" + fmtBytes(p.transferred) + "）");
+                }
+              };
+            })(), uploadTag).then(function () {
+              clearInterval(cancelWatch);
+              doneBytes += size - offset;
+            }, function (err) {
+              clearInterval(cancelWatch);
+              if (err && err.cancelled) throw err;
+              // 直传失败降级：按块 XHR 续传。getPcFileStream 虽共用频道，但 readPcChunk
+              // 经 _bridgeReadQueue 全局串行 + 短读可控（攒够 len 即收），单次调用是安全的；
+              // 之前的事故是多文件并发长流互相串，不是单次短读。
+              // 必须先查服务端 .part 真实大小：直传的 MOVE 可能已落成 .part（commit 前失败），
+              // 用过期 offset 会 409。
+              log("直传失败，降级分块续传 " + rel + "（" + (err.message || err) + "）", "lg-err");
+              if (typeof getBridge().getPcFileStream !== "function") throw err;
+              return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
+                .then(function (d) {
+                  var partSize = (d && d.size && d.size <= size) ? d.size : 0;
+                  // 直传 MOVE 已把完整 .part 落好时，直接补记账走 commit
+                  if (partSize >= size) { doneBytes += size - offset; return; }
+                  if (partSize > offset) doneBytes += partSize - offset;
+                  return chunkLoop(partSize);
+                })
+                .catch(function (e2) {
+                  if (e2 && e2.cancelled) throw e2;
+                  throw new Error("直传与分块续传均失败：" + (err.message || err) +
+                    " / 续传：" + (e2.message || e2));
+                });
+            });
+          }
+          // 降级分块续传：定长短读（allowLargeChunk），单次调用安全
           function chunkLoop(off) {
             if (state.cancel) return Promise.reject({ cancelled: true });
             if (off >= size) return Promise.resolve();
             var end = Math.min(off + CHUNK_SIZE, size);
             var base = off;
-            return readEntryChunk(ent, base, end).then(function (blob) {
+            return readPcChunk(getBridge(), ent.abs, base, end - base, ent.size, { allowLargeChunk: true })
+              .then(function (blob) {
               if (blob.size !== end - base) throw new Error("读取的文件分块长度不符，请重新扫描目录");
               return withRetry(function () {
                 return xhrPut(url + base, blob, function (loaded) {
                   tickSpeed(loaded);
-                  setProgress("上传中", rel + "（" + fmtBytes(blob.size) + "）");
+                  setProgress("上传中", rel + "（" + fmtBytes(loaded) + "）");
                 });
               }, rel);
             }).then(function () {
@@ -959,26 +1036,43 @@
   //   getPcFileStream(path, start, onData, onEnd, onError) → 从 start 流到 EOF
   // 所有调用按 invoke 语义防御：promise 可能先回 undefined、结果稍后走回调。
 
+  // 主应用把 electronAPI 塞进微前端 globalData 时经过结构化克隆，函数成员会被剥掉，
+  // 插件侧拿到的是只剩数据字段的空壳。旧版 getBridge 每次重新解析且 globalData 优先，
+  // 一旦 App 填充了 globalData，扫描时用的真 preload 对象就会被空壳顶替——
+  // 表现为「列目录能用、upLoadToNas 判大文件失败」的割裂。故：真对象优先 + 健全性校验 + 缓存命中结果。
+  function bridgeUsable(b) {
+    return !!(b && typeof b === "object" &&
+      typeof b.getPcFileList === "function" &&
+      typeof b.getPcFileStream === "function" &&
+      typeof b.upLoadToNas === "function");
+  }
+
+  var _bridge = undefined;
   function getBridge() {
-    try {
-      var g = window.microApp ? window.microApp.getGlobalData() : null;
-      if (g && g.electronAPI) return g.electronAPI;
-    } catch (e) {}
+    if (_bridge !== undefined) return _bridge;
+    var candidates = [];
     try {
       var rw = window.__MICRO_APP_WINDOW__ && window.__MICRO_APP_WINDOW__.rawWindow;
       if (rw) {
         for (var k in rw) {
-          try { if (rw[k] && rw[k].electronAPI) return rw[k].electronAPI; } catch (e) {}
+          try { if (rw[k] && rw[k].electronAPI) candidates.push(rw[k].electronAPI); } catch (e) {}
         }
       }
     } catch (e) {}
+    try { if (window.electronAPI) candidates.push(window.electronAPI); } catch (e) {}
     try {
       for (var i = 0; i < window.frames.length; i++) {
-        if (window.frames[i] && window.frames[i].electronAPI) return window.frames[i].electronAPI;
+        try { if (window.frames[i] && window.frames[i].electronAPI) candidates.push(window.frames[i].electronAPI); } catch (e) {}
       }
     } catch (e) {}
-    try { if (window.electronAPI) return window.electronAPI; } catch (e) {}
-    return null;
+    try {
+      var g = window.microApp ? window.microApp.getGlobalData() : null;
+      if (g && g.electronAPI) candidates.push(g.electronAPI);
+    } catch (e) {}
+    for (var j = 0; j < candidates.length; j++) {
+      if (bridgeUsable(candidates[j])) return (_bridge = candidates[j]);
+    }
+    return null;   // 不缓存失败：桥可能稍后才被注入，下次调用再找
   }
 
   function nativeListDir(api, pcPath) {
@@ -1082,11 +1176,13 @@
   // 桥接接口实际为 (path, start, onData, onEnd, onError)，会一直读到 EOF。
   // 它没有定长读取或暂停能力，故只作小文件回退，并串行调用以免全局 IPC 事件串流。
   var _bridgeReadQueue = Promise.resolve();
-  function readBridgeChunk(api, abs, off, len, size) {
+  function readBridgeChunk(api, abs, off, len, size, opts) {
     if (!api || typeof api.getPcFileStream !== "function") {
       return Promise.reject(new Error("桌面端无法读取 PC 文件，请用「选择文件夹」重新扫描"));
     }
-    if (size > BRIDGE_MAX_FILE) {
+    // BRIDGE_MAX_FILE 限制的是"未知调用方的整读"（流到 EOF 攒满即收才安全）。
+    // 降级续传是定长短读（攒够 len 立即结束），不受此限。
+    if (size > BRIDGE_MAX_FILE && !(opts && opts.allowLargeChunk)) {
       return Promise.reject(new Error("原生桥接读取大文件不安全，请用「选择文件夹」重新扫描"));
     }
     return new Promise(function (resolve, reject) {
@@ -1120,11 +1216,11 @@
     });
   }
 
-  function readPcChunk(api, abs, off, len, size) {
+  function readPcChunk(api, abs, off, len, size, opts) {
     var fs = getPcFs();
     if (fs) return readNodeChunk(fs, abs, off, len);
     var task = _bridgeReadQueue.then(function () {
-      return readBridgeChunk(api, abs, off, len, size);
+      return readBridgeChunk(api, abs, off, len, size, opts);
     });
     _bridgeReadQueue = task.catch(function () {});
     return task;
@@ -1132,7 +1228,87 @@
 
   function readEntryChunk(ent, off, end) {
     if (ent.file) return Promise.resolve(ent.file.slice(off, end));
-    return readPcChunk(getBridge(), ent.abs, off, end - off, ent.size);
+    return readPcChunk(getBridge(), ent.abs, off, end - off, ent.size, { allowLargeChunk: true });
+  }
+
+  // （已废弃 getPcFileStream 流式上传：全局共用回传频道无法隔离，失败后主进程仍灌数据、僵尸回调串流。原生模式统一走 upLoadToNas 直传。）
+
+  // 流式失败时的兜底：upLoadToNas（主进程 WebDAV 直传）。
+  // dPath 必须落在 .temp_upload_dir/ 下；上传完成后 rename 成目标 .pcbp.part，再走 commit。
+  var _webDavCredCache = null;
+  function fetchWebDavCreds() {
+    if (_webDavCredCache) return _webDavCredCache;
+    _webDavCredCache = fetch("/cgi-bin/luci/filemgr/get_pool_info", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }).then(function (r) { return r.json(); }).then(function (j) {
+      var w = j && j.data && j.data.webDAV;
+      if (!w) throw new Error("无法获取 WebDAV 凭证");
+      return w;
+    }).catch(function (e) {
+      _webDavCredCache = null; // 失败可重试
+      throw e;
+    });
+    return _webDavCredCache;
+  }
+
+  function uploadViaNative(job, ent, rel, size, mtime, offset, onProgress, forceTag) {
+    var bridge = getBridge();
+    if (!bridge || typeof bridge.upLoadToNas !== "function") {
+      return Promise.reject(new Error("桌面端缺少原生上传接口，无法传输大文件"));
+    }
+    return fetchWebDavCreds().then(function (webDAV) {
+      // realdpath 必须是 WebDAV URL 格式（/pool0/data/...），而 job.destination 是
+      // 文件系统格式（/nas/pool0/u<uid>/data/...）。WebDAV nginx 规则：uri 不以
+      // /pool*/ 开头一律拒绝（实测 451/500），直接拼 destination 的 MOVE 必失败。
+      // 正确换算：/nas/pool0/<uid>/data → /pool0/data（root /home/<uid> 下 pool0 是
+      // 池软链，二者指向同一目录——已在真机用 PUT+MOVE 实证 204）。
+      // 注意：get_pool_info 的 alias_root 是 /home/u<uid>（SMB 语义），不能拿来当
+      // WebDAV URL 前缀（踩过：MOVE 到 /home/... 被 500 拒，所有文件 code=-1 连环降级）。
+      var dataRoot = (state.config && state.config.data_root) || "";
+      var destAbs = String(job.destination || "").replace(/[\\/]+$/, "") + "/" + rel;
+      var realPath;
+      if (dataRoot && destAbs.indexOf(dataRoot + "/") === 0) {
+        realPath = destAbs.slice(dataRoot.length);   // /pcbackup/work/xxx → 挂到池根
+        realPath = (webDAV.poolRoot || "/pool0/data") + realPath;
+      } else {
+        // 换算不出来（自定义 destination）：池内 pcbackup 子目录兜底
+        realPath = "/pool0/data/pcbackup" + destAbs.replace(/^\/nas\/pool[^/]+/, "");
+      }
+      var partPath = realPath + ".pcbp.part";
+      return new Promise(function (resolve, reject) {
+        var tag = forceTag || ("pcb_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8));
+        var tmp = "/pool0/data/.temp_upload_dir/" + tag + ".temptd_" + Date.now();
+        var done = false;
+        function fin(err) {
+          if (done) return;
+          done = true;
+          if (err) reject(err instanceof Error ? err : new Error(String(err)));
+          else resolve();
+        }
+        try {
+          bridge.upLoadToNas({
+            sPath: ent.abs,
+            dPath: tmp,
+            realdpath: partPath,
+            offset: offset || 0,
+            isNeedHead: false,
+            reUse: false,
+            tag: tag,
+            webParam: JSON.stringify(webDAV),
+            size: size,
+            mtime: mtime || 0
+          }, function (p) {
+            if (onProgress) onProgress(p);
+          }, function () { fin(); }, function (e) {
+            var msg = (e && e.message) || (e && e.error && e.error.message) || (e && e.code) || e;
+            var detail = e && e.error ? " [" + String(e.error).slice(0, 200) + "]" : "";
+            fin(new Error("原生上传失败：" + msg + detail));
+          }, function () {});
+        } catch (e) { fin(e); }
+      });
+    });
   }
 
   // 原生读取入口：整树 → 排除过滤 → 并发补 mtime → 走既有比对流水
@@ -1203,94 +1379,47 @@
     });
   }
 
-  // 原生目录选择框 v2——真机实测规律：
-  //   带函数回调 → IPC clone 必炸；带字符串占位 → 被门面校验拦下（不弹框）；
-  //   纯 task 零回调 → 弹框成功 ✓，但结果被门面丢弃。
-  // 结果捕获假说：对话框结果走 ipc 事件 → 用 listenToMain 订阅（名字逐个试，
-  // fn.length 先探签名），兜底翻"最近选择"痕迹。
-  var _browseSeq = 0;
-  function npLogLine(msg) {
-    var box = $("npLog");
-    if (box) {
-      var div = document.createElement("div");
-      div.textContent = msg;
-      box.appendChild(div);
-      box.scrollTop = box.scrollHeight;
-    }
-    try { console.log("[browse] " + msg); } catch (e) {}
-  }
-
+  // 原生目录选择框。preload 真实签名（反混淆 bridge.js 确认）：
+  //   openFileDialog(onResult, type, extensions)
+  //   → ipcRenderer.send("openFileDialog", type, extensions)
+  //   → 结果 {canceled, filePaths} 从 "openFileDialog_replay" once 回传给 onResult。
+  // 主进程按 type 分支：'folder' → [openDirectory, multiSelections]。
+  // 旧版把 task 对象当第 1 参传，回调位是对象（replay 调用它即抛错）、type 也不命中
+  // 任何分支，结果永远收不到——30 秒兜底超时报「没有捕获到选择结果」。
+  var _browseBusy = false;
   function nativeBrowse() {
     var bridge = getBridge();
     if (!bridge) { toast("「浏览…」需在桌面 App 内使用", true); return; }
-    var tag = "br" + (++_browseSeq) + "_" + Date.now();
-    var got = false;
-
-    function onResult(v) {
-      if (v === undefined || v === null) return;
-      npLogLine("收到结果：" + JSON.stringify(v).slice(0, 200));
-      if (got) return;
-      var p = extractWinPath(v);
-      if (p) {
-        got = true;
-        $("npPickPath").value = p;
-        toast("✓ 选目录成功：" + p);
-        nativePick(p);   // 显式选好目录＝确认，直接开始
-      }
+    if (typeof bridge.openFileDialog !== "function") {
+      toast("当前桌面端不支持目录选择框，请直接输入路径后点「确认」", true);
+      return;
     }
-
-    // 探签名 + 多名字武装监听
+    if (_browseBusy) return;   // dialog 回调是一次性 once，防重复弹框串结果
+    _browseBusy = true;
+    var armed = false;
+    function done() { _browseBusy = false; }
     try {
-      npLogLine("listenToMain.length = " + (bridge.listenToMain ? bridge.listenToMain.length : "无此函数"));
-    } catch (e) {}
-    var names = ["openFileDialog", "openFileDialog_" + tag, tag, "fileDialog", "file-dialog",
-                 "dialog", "openDirectory", "selectFolder", "selectedPath", "folderSelected"];
-    names.forEach(function (n) {
-      try {
-        var r = bridge.listenToMain(n, onResult);
-        npLogLine("listenToMain('" + n + "') → " + String(r).slice(0, 40));
-        if (r && typeof r.then === "function") {
-          r.then(function (v) { if (v !== undefined) onResult(v); }).catch(function () {});
+      bridge.openFileDialog(function (v) {
+        armed = true;
+        done();
+        if (!v || v.canceled) return;
+        var p = extractWinPath(v);
+        if (p) {
+          $("npPickPath").value = p;
+          toast("✓ 选目录成功：" + p);
+          nativePick(p);   // 显式选好目录＝确认，直接开始
+        } else {
+          toast("没有捕获到选择结果", true);
         }
-      } catch (e) {
-        npLogLine("listenToMain('" + n + "') 抛：" + (e && e.message));
-      }
-    });
-    // 签名若只有 1 参，再试纯回调订阅
-    try {
-      if (bridge.listenToMain && bridge.listenToMain.length <= 1) {
-        var r0 = bridge.listenToMain(onResult);
-        npLogLine("listenToMain(纯回调) → " + String(r0).slice(0, 40));
-      }
-    } catch (e) { npLogLine("listenToMain(纯回调) 抛：" + (e && e.message)); }
-
-    // 弹框：零回调姿势（唯一实测能弹框的）
-    try {
-      var r2 = bridge.openFileDialog({ properties: ["openDirectory", "createDirectory"], tag: tag });
-      npLogLine("openFileDialog(task) 同步返回：" + String(r2).slice(0, 40));
-      if (r2 && typeof r2.then === "function") {
-        r2.then(function (v) { if (v !== undefined) onResult(v); }).catch(function () {});
-      }
+      }, "folder");
     } catch (e) {
+      done();
       toast("openFileDialog 抛异常：" + (e && e.message), true);
       return;
     }
     toast("已打开目录选择框——选好后自动开始读取");
-
-    // 兜底：30 秒没等到就翻"最近选择"痕迹
-    setTimeout(function () {
-      if (got) return;
-      try {
-        var d = bridge.getDropFilePaths([]);
-        npLogLine("兜底 getDropFilePaths([]) → " + JSON.stringify(d).slice(0, 120));
-        if (Array.isArray(d) && d.length) onResult(d);
-      } catch (e) { npLogLine("兜底 getDropFilePaths 抛：" + (e && e.message)); }
-      try {
-        var l = bridge.localFileList({ tag: tag }, onResult, function () {}, function () {});
-        npLogLine("兜底 localFileList 同步返回：" + String(l).slice(0, 40));
-      } catch (e) {}
-      if (!got) toast("没捕获到选择结果——把探测台/控制台日志贴回来", true);
-    }, 30000);
+    // 回调从未到达（主进程异常等）：解除占用，允许重试
+    setTimeout(function () { if (!armed) done(); }, 60000);
   }
 
   // 从各种返回形状里挖 Windows 绝对路径
@@ -1465,8 +1594,9 @@
     });
     $("btnCancel").addEventListener("click", function () {
       state.cancel = true;
+      abortAllUploads();   // 立即断掉进行中的 PUT，不等当前文件传完
       $("btnCancel").disabled = true;
-      log("正在取消…（当前文件传输完成后停止）", "lg-err");
+      log("正在取消…（已中断进行中的传输）", "lg-err");
     });
     $("btnDoneBack").addEventListener("click", function () { show("view-jobs"); loadJobs(); });
     $("btnDoneAgain").addEventListener("click", function () {
