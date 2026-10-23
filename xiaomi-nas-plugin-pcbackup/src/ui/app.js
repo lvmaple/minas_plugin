@@ -900,9 +900,10 @@
       });
     }
     chain = chain.then(function () {
-      // 文件间并发 3 路（与桌面 App uploadConcurrentLimit=3 对齐：
-      // 4 路时其内置 P2P 代理偶发转发乱序，MOVE 早于 PUT 落盘 → ENOENT）
-      var CONCURRENCY = 3;
+      // 文件间并发 6 路。目录预建修复后 MOVE 失败根因已消除；直传走主进程
+      // 连接池不占浏览器同域连接数，6 路实测提吞吐。若出现 PUT 超时/连接重置
+      // 再回落（App 自身限 3 是保守值，并非硬上限）。
+      var CONCURRENCY = 6;
       var queue = plan.upload.slice();
       function worker() {
         if (state.cancel || !queue.length) return Promise.resolve();
