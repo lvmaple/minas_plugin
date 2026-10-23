@@ -663,8 +663,8 @@
     if (state.running || !state.plan) return;
     if (state.sourcePath && !getPcFs()) {
       var bridge = getBridge();
-      if (!bridge || typeof bridge.getPcFileStream !== "function") {
-        toast("桌面端无法读取 PC 文件，请点「选择文件夹」重新扫描", true);
+      if (!bridge || typeof bridge.upLoadToNas !== "function") {
+        toast("桌面端缺少原生上传接口，请点「选择文件夹」用浏览器模式", true);
         return;
       }
     }
@@ -817,36 +817,30 @@
               }, function (err) {
               clearInterval(cancelWatch);
               if (err && err.cancelled) throw err;
-              // 直传失败降级：按块 XHR 续传。getPcFileStream 虽共用频道，但 readPcChunk
-              // 经 _bridgeReadQueue 全局串行 + 短读可控（攒够 len 即收），单次调用是安全的；
-              // 之前的事故是多文件并发长流互相串，不是单次短读。
-              // 必须先查服务端 .part 真实大小：直传的 MOVE 可能已落成 .part（commit 前失败），
-              // 用过期 offset 会 409。
-              log("直传失败，降级分块续传 " + rel + "（" + (err.message || err) + "）", "lg-err");
-              if (typeof getBridge().getPcFileStream !== "function") throw err;
+              // 直传失败不再走 getPcFileStream 降级——该通道主进程会从 start 读到
+              // EOF（无取消/背压），preload 对每个 chunk 打一条 console.warn 并被
+              // 主进程日志转发：降级读大文件= 每秒数千条日志（实测 23s 卷 20MB、
+              // 日志海啸+IPC 饱和把页面拖死）。改为只对账：MOVE 已落好 .part 就补记
+              // 账走 commit，否则标记失败（断点续传下轮重跑）。
               return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
                 .then(function (d) {
                   var partSize = (d && d.size && d.size <= size) ? d.size : 0;
-                  // 直传 MOVE 已把完整 .part 落好时，直接补记账走 commit
-                  if (partSize >= size) { doneBytes += size - offset; return; }
-                  if (partSize > offset) doneBytes += partSize - offset;
-                  return chunkLoop(partSize);
-                })
-                .catch(function (e2) {
-                  if (e2 && e2.cancelled) throw e2;
-                  throw new Error("直传与分块续传均失败：" + (err.message || err) +
-                    " / 续传：" + (e2.message || e2));
+                  if (partSize >= size) {
+                    log("直传中断但服务端已有完整数据，已补记 " + rel, "lg-skip");
+                    doneBytes += size - offset;
+                    return;
+                  }
+                  throw new Error("原生上传失败（可在下轮续传）：" + (err.message || err));
                 });
             });
           }
-          // 降级分块续传：定长短读（allowLargeChunk），单次调用安全
+          // 无原生桥（纯浏览器模式）：File 对象切片直读，不经 getPcFileStream
           function chunkLoop(off) {
             if (state.cancel) return Promise.reject({ cancelled: true });
             if (off >= size) return Promise.resolve();
             var end = Math.min(off + CHUNK_SIZE, size);
             var base = off;
-            return readPcChunk(getBridge(), ent.abs, base, end - base, ent.size, { allowLargeChunk: true })
-              .then(function (blob) {
+            return Promise.resolve(readEntryChunk(ent, base, end)).then(function (blob) {
               if (blob.size !== end - base) throw new Error("读取的文件分块长度不符，请重新扫描目录");
               return withRetry(function () {
                 return xhrPut(url + base, blob, function (loaded) {
@@ -1071,9 +1065,9 @@
   // 一旦 App 填充了 globalData，扫描时用的真 preload 对象就会被空壳顶替——
   // 表现为「列目录能用、upLoadToNas 判大文件失败」的割裂。故：真对象优先 + 健全性校验 + 缓存命中结果。
   function bridgeUsable(b) {
+    // getPcFileStream 不再是必需项（通道已废弃）；openFileDialog 用于目录选择
     return !!(b && typeof b === "object" &&
       typeof b.getPcFileList === "function" &&
-      typeof b.getPcFileStream === "function" &&
       typeof b.upLoadToNas === "function");
   }
 
@@ -1205,55 +1199,14 @@
 
   // 桥接接口实际为 (path, start, onData, onEnd, onError)，会一直读到 EOF。
   // 它没有定长读取或暂停能力，故只作小文件回退，并串行调用以免全局 IPC 事件串流。
-  var _bridgeReadQueue = Promise.resolve();
-  function readBridgeChunk(api, abs, off, len, size, opts) {
-    if (!api || typeof api.getPcFileStream !== "function") {
-      return Promise.reject(new Error("桌面端无法读取 PC 文件，请用「选择文件夹」重新扫描"));
-    }
-    // BRIDGE_MAX_FILE 限制的是"未知调用方的整读"（流到 EOF 攒满即收才安全）。
-    // 降级续传是定长短读（攒够 len 立即结束），不受此限。
-    if (size > BRIDGE_MAX_FILE && !(opts && opts.allowLargeChunk)) {
-      return Promise.reject(new Error("原生桥接读取大文件不安全，请用「选择文件夹」重新扫描"));
-    }
-    return new Promise(function (resolve, reject) {
-      var parts = [], got = 0, done = false, timer;
-      function finish(error) {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        if (error) reject(error);
-        else if (got !== len) reject(new Error("读取的文件分块长度不符，请重新扫描目录"));
-        else resolve(new Blob(parts));
-      }
-      function armTimer() {
-        if (done) return;
-        clearTimeout(timer);
-        timer = setTimeout(function () { finish(new Error("读取 PC 文件超时")); }, 30000);
-      }
-      try {
-        api.getPcFileStream(abs, off, function (value) {
-          if (done) return;
-          var bytes = toBytes(value);
-          if (!bytes) { finish(new Error("桌面端返回了无法识别的文件数据")); return; }
-          var keep = Math.min(bytes.length, len - got);
-          if (keep > 0) { parts.push(bytes.subarray(0, keep)); got += keep; }
-          armTimer();
-        }, function () { finish(); }, function (error) {
-          finish(new Error("读取 PC 文件失败：" + (error && error.message || error)));
-        });
-        armTimer();
-      } catch (error) { finish(error); }
-    });
-  }
+  // （readBridgeChunk/_bridgeReadQueue 已随 getPcFileStream 通道一并废弃删除）
 
   function readPcChunk(api, abs, off, len, size, opts) {
     var fs = getPcFs();
     if (fs) return readNodeChunk(fs, abs, off, len);
-    var task = _bridgeReadQueue.then(function () {
-      return readBridgeChunk(api, abs, off, len, size, opts);
-    });
-    _bridgeReadQueue = task.catch(function () {});
-    return task;
+    // getPcFileStream 通道禁用（无取消/无背压 + preload 每 chunk 一条 warn 转发，
+    // 降级读大文件曾造成日志海啸）。无 Node fs 的环境一律拒绝。
+    return Promise.reject(new Error("此环境无法分块读取 PC 文件，请重新选择目录"));
   }
 
   function readEntryChunk(ent, off, end) {
