@@ -20,6 +20,8 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from functools import lru_cache, wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -29,7 +31,7 @@ except ImportError:
     pwd = None
 
 PORT = int(os.environ.get("PLUG_PORT", "9303"))
-PLUGIN_VERSION = "1.6.1"
+PLUGIN_VERSION = "1.6.2"
 _FILES_DIR = os.path.dirname(os.path.abspath(__file__))          # <plugin>/src/files
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(_FILES_DIR))       # <plugin>/
 DATA_DIR = os.environ.get("PCBACKUP_DATA") or os.path.join(PLUGIN_ROOT, "etc")
@@ -66,16 +68,88 @@ DEST_ALLOWED_PREFIXES = ("/nas/pool0/", "/home/", "/tmp/", "/mnt/", "/media/", "
 _JOBS_LOCK = threading.RLock()
 _JOB_LOCKS = {}
 _UPLOAD_LOCKS = {}
+_LIFECYCLE_LOCKS = {}
+_LOCKS_LOCK = threading.RLock()
 
 
 def _job_lock(jid):
-    with _JOBS_LOCK:
+    with _LOCKS_LOCK:
         return _JOB_LOCKS.setdefault(jid, threading.RLock())
 
 
 def _upload_lock(key):
-    with _JOBS_LOCK:
+    with _LOCKS_LOCK:
         return _UPLOAD_LOCKS.setdefault(key, threading.RLock())
+
+
+class _JobLifecycle:
+    """Concurrent file operations; exclusive changes wait for their completion.
+
+    Lock order: lifecycle -> file -> short manifest lock. Never wait for a
+    lifecycle permit while holding _JOBS_LOCK. Writers may reenter helpers.
+    """
+    def __init__(self):
+        self.condition = threading.Condition(threading.RLock())
+        self.readers = {}
+        self.writer = None
+        self.depth = 0
+        self.waiting = 0
+
+    @contextmanager
+    def permit(self, exclusive=False):
+        tid = threading.get_ident()
+        with self.condition:
+            if exclusive:
+                if self.writer == tid:
+                    self.depth += 1
+                else:
+                    if tid in self.readers:
+                        raise RuntimeError("Cannot upgrade a file operation to a lifecycle change")
+                    self.waiting += 1
+                    try:
+                        self.condition.wait_for(lambda: self.writer is None and not self.readers)
+                        self.writer, self.depth = tid, 1
+                    finally:
+                        self.waiting -= 1
+            else:
+                self.condition.wait_for(lambda: self.writer == tid or (
+                    self.writer is None and (not self.waiting or tid in self.readers)))
+                self.readers[tid] = self.readers.get(tid, 0) + 1
+        try:
+            yield
+        finally:
+            with self.condition:
+                if exclusive:
+                    self.depth -= 1
+                    if not self.depth:
+                        self.writer = None
+                else:
+                    self.readers[tid] -= 1
+                    if not self.readers[tid]:
+                        del self.readers[tid]
+                self.condition.notify_all()
+
+
+def _lifecycle(jid):
+    with _LOCKS_LOCK:
+        return _LIFECYCLE_LOCKS.setdefault(jid, _JobLifecycle())
+
+
+def _job_operation(exclusive=False, check=True):
+    def decorate(fn):
+        @wraps(fn)
+        def run(job, *args, **kwargs):
+            jid = job["id"] if isinstance(job, dict) else job
+            with _lifecycle(jid).permit(exclusive):
+                if check and isinstance(job, dict):
+                    current = load_jobs().get(jid)
+                    if current is None:
+                        return 404, "任务不存在"
+                    if any(current.get(k) != job.get(k) for k in ("destination", "exclude", "pc_path")):
+                        return 409, "任务配置已变化，请刷新任务"
+                return fn(job, *args, **kwargs)
+        return run
+    return decorate
 
 
 # ── 路径安全（核心！插件以 root 运行） ──────────────────────
@@ -143,14 +217,29 @@ def validate_dest(dest):
     return _canonical_dest(dest) is not None
 
 
+@lru_cache(maxsize=16)
+def _owner_ids(user):
+    pw = pwd.getpwnam(user)
+    return pw.pw_uid, pw.pw_gid
+
+
+def _set_native_owner(fd, st):
+    if pwd is not None and PLUG_USER and os.geteuid() == 0:
+        uid, gid = _owner_ids(PLUG_USER)
+        if (st.st_uid, st.st_gid) != (uid, gid):
+            os.fchown(fd, uid, gid)
+
+
 def _try_chown(path):
     """服务以 root 运行时，把产物归属还给插件用户（SMB 访问需要）。"""
     if pwd is None or not PLUG_USER:
         return
     try:
         if os.geteuid() == 0:
-            pw = pwd.getpwnam(PLUG_USER)
-            os.chown(path, pw.pw_uid, pw.pw_gid)
+            uid, gid = _owner_ids(PLUG_USER)
+            st = os.stat(path)
+            if (st.st_uid, st.st_gid) != (uid, gid):
+                os.chown(path, uid, gid)
     except Exception:
         pass
 
@@ -259,6 +348,8 @@ def _apply_line(m, ln):
     excl = m["excluded"]
     if op == "up":
         ent = {"s": ln.get("s", 0), "m": ln.get("m", 0), "t": ln.get("t", 0)}
+        if ln.get("native_token"):
+            ent["native_token"] = ln["native_token"]
         if ln.get("adopted"):
             ent["adopted"] = True
         files[p] = ent
@@ -350,9 +441,13 @@ def manifest_upsert(job, entries):
                   "s": ent.get("s", 0), "m": ent.get("m", 0), "t": ent.get("t", 0)}
             if ent.get("adopted"):
                 ln["adopted"] = True
-            _apply_line(m, ln)
+            if ent.get("native_token"):
+                ln["native_token"] = ent["native_token"]
             lines.append(ln)
         _run_append(job, lines)
+        # Do not acknowledge an append failure through a successful cache hit.
+        for ln in lines:
+            _apply_line(m, ln)
 
 
 def manifest_del(job, rels):
@@ -398,6 +493,7 @@ def manifest_meta(job, folder):
             _run_append(job, [ln])
 
 
+@_job_operation(exclusive=True)
 def manifest_reset(job, folder):
     """目录切换：清空账本、作废全部运行日志，从零重建。返回新账本。
     顺序约束：先作废日志、再原子写主档，最后才换内存缓存——中途失败时旧账本仍在盘上，
@@ -419,6 +515,7 @@ def manifest_reset(job, folder):
         return m
 
 
+@_job_operation(exclusive=True)
 def compact_manifest(job):
     """使用前压实（合并点定在比对前）：把折叠后的内存态写成紧凑主档+镜像，
     并把已折叠的运行日志转 .done（保留最近 RUN_KEEP_DONE 段作审计）。
@@ -515,6 +612,7 @@ def resume_status(job):
         }
 
 
+@_job_operation(exclusive=True)
 def start_resume(job, body):
     source_path = _clean_pc_path(body.get("source_path"))
     if not source_path or not re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", source_path):
@@ -555,6 +653,7 @@ def start_resume(job, body):
         return resume_status(job)
 
 
+@_job_operation(exclusive=True)
 def finish_run(job, stats):
     """Keep an unfinished checkpoint; remove it only after every planned item settles."""
     with _job_lock(job["id"]):
@@ -716,9 +815,13 @@ def build_plan_gates(job, body):
     return incoming, manifest, None, folder, prune
 
 
+@_job_operation(exclusive=True, check=False)
 def _scan_worker(job, folder, incoming, manifest, prune=False):
     st = _SCAN_STATE[job["id"]]
     try:
+        current = load_jobs().get(job["id"])
+        if current is None or any(current.get(k) != job.get(k) for k in ("destination", "exclude", "pc_path")):
+            raise ValueError("任务配置已变化，请重新扫描")
         st["phase"] = "snapshot"
         compact_manifest(job)   # 使用前压实：合并点在比对前（崩溃/关窗口留下的日志在此收编）
         snapshot = _disk_snapshot(job["destination"], st)
@@ -776,6 +879,7 @@ def _scan_worker(job, folder, incoming, manifest, prune=False):
         st["error"] = "%s: %s" % (type(e).__name__, e)[:300]
 
 
+@_job_operation(exclusive=True)
 def build_plan(job, body):
     """同步入口：门禁通过后启动后台比对线程。
     busy 检查必须先于门禁的破坏性副作用（reset/排除剔除），
@@ -790,6 +894,7 @@ def build_plan(job, body):
         incoming, manifest, err, folder, prune = build_plan_gates(job, body)
         if err is not None:
             return err
+        _rotate_native_generation(job)
         if old_run:
             os.remove(resume_path(job))
         _SCAN_STATE[job["id"]] = {
@@ -802,6 +907,7 @@ def build_plan(job, body):
     return 200, {"started": True, "total": len(incoming)}
 
 
+@_job_operation()
 def put_chunk(job, rel, offset, body):
     """分块写入 .part 文件（幂等：offset <= 当前大小时先截断回 offset 再写，
     网络中断重试同一块不会错位；offset > 当前大小说明客户端状态过期，拒绝）。"""
@@ -832,6 +938,7 @@ def part_size(job, rel):
     return 200, {"size": os.path.getsize(part) if os.path.isfile(part) else 0}
 
 
+@_job_operation()
 def mkdirs_for_job(job, rels):
     """Validate the whole batch; never report success for silently omitted paths."""
     if not isinstance(rels, list) or len(rels) > MKDIRS_BATCH_MAX:
@@ -880,6 +987,37 @@ def _committed_file_matches(job, rel, size, mtime):
                 and entry.get("m") == mtime and dest and _has_size(dest, size))
 
 
+def _rotate_native_generation(job):
+    _save_json(os.path.join(job_dir(job["id"]), "native-generation.json"), uuid.uuid4().hex)
+
+
+def _native_context(job):
+    with _job_lock(job["id"]):
+        path = os.path.join(job_dir(job["id"]), "native-generation.json")
+        generation = _load_json(path, None)
+        if not generation:
+            _rotate_native_generation(job)
+            generation = _load_json(path, None)
+        resume = load_resume(job)
+        return {"generation": generation, "run_id": resume["run_id"] if resume else ""}
+
+
+def _published_identity(st):
+    return {"dev": st.st_dev, "ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _published_matches(record, dest):
+    identity = record.get("publishing")
+    if not identity:
+        return False
+    try:
+        st = os.stat(dest)
+        return stat.S_ISREG(st.st_mode) and identity == _published_identity(st)
+    except OSError:
+        return False
+
+
+@_job_operation()
 def prepare_native_upload(job, body):
     """Keep an isolated native staging identity; the NAS owns the final rename."""
     rel, size, mtime = body.get("p"), body.get("s"), body.get("m")
@@ -894,34 +1032,47 @@ def prepare_native_upload(job, body):
         return 400, "原生上传路径非法"
     identity = {"p": rel, "s": size, "m": mtime, "source": source,
                 "destination": job["destination"], "data_root": USER_DATA_ROOT}
-    with _job_lock(job["id"]):
+    context = _native_context(job)
+    if body.get("run_id", context["run_id"]) != context["run_id"]:
+        return 409, "续传记录已变化，请刷新任务"
+    with _upload_lock(part):
         record = _load_json(state_path, {})
         if not isinstance(record, dict):
             record = {}
         paths = _native_paths(record)
-        same = all(record.get(k) == v for k, v in identity.items())
+        # Upgrade a v1 ready/settled attempt without retransmitting its data.
+        same = all(record.get(k) == v for k, v in identity.items()) and (
+            record.get("version") == 1 or all(record.get(k) == v for k, v in context.items()))
         uploaded = bool(same and paths and (
             _has_size(paths["ready"], size)
             or (record.get("settled") and _has_size(paths["temp"], size))
             or (record.get("finalized") and (
-                _has_size(part, size) or _committed_file_matches(job, rel, size, mtime)))))
+                _has_size(part, size) or _committed_file_matches(job, rel, size, mtime)))
+            or _published_matches(record, dest)))
+        changed = False
         if not uploaded:
             # An unacknowledged old PUT may still be running. Give a retry its own
             # path and token so late callbacks cannot replace the newer attempt.
-            record = dict(identity, version=1, token=uuid.uuid4().hex,
+            record = dict(identity, **context, version=2, token=uuid.uuid4().hex,
                           prepared_ms=int(time.time() * 1000), settled=False, finalized=False)
             paths = _native_paths(record)
+            changed = True
+        elif record.get("version") == 1:
+            record.update(context, version=2)
+            changed = True
         if paths is None:
             return 400, "原生上传临时目录非法"
         _mkdir_chowned(os.path.dirname(dest))
         _mkdir_chowned(os.path.dirname(paths["temp"]))
         if os.stat(os.path.dirname(dest)).st_dev != os.stat(os.path.dirname(paths["temp"])).st_dev:
             return 400, "原生上传目标需与用户数据目录位于同一文件系统，请使用浏览器选择文件夹"
-        _save_json(state_path, record)
+        if changed:
+            _save_json(state_path, record)
         return 200, {"token": record["token"], "temp_name": paths["temp_name"],
                      "ready_name": paths["ready_name"], "uploaded": uploaded}
 
 
+@_job_operation()
 def complete_native_upload(job, body):
     """Reconcile a terminal native attempt, including a full PUT whose MOVE failed."""
     rel, token = body.get("p"), body.get("token")
@@ -934,11 +1085,12 @@ def complete_native_upload(job, body):
     if state_path is None or dest is None or part is None:
         return 400, "原生上传路径非法"
     # Keep the same lock order as commit_file: file, then manifest/job.
-    with _upload_lock(part), _job_lock(job["id"]):
+    with _upload_lock(part):
         record = _load_json(state_path, {})
         if (not isinstance(record, dict) or record.get("token") != token
                 or record.get("destination") != job["destination"]
-                or record.get("data_root") != USER_DATA_ROOT):
+                or record.get("data_root") != USER_DATA_ROOT
+                or any(record.get(k) != v for k, v in _native_context(job).items())):
             return 409, "原生上传记录已变化，请重试"
         paths = _native_paths(record)
         if paths is None:
@@ -946,8 +1098,9 @@ def complete_native_upload(job, body):
         size = record["s"]
         record["settled"] = True
         _save_json(state_path, record)
-        if record.get("finalized") and (
-                _has_size(part, size) or _committed_file_matches(job, rel, size, record["m"])):
+        if (record.get("finalized") and (
+                _has_size(part, size) or _committed_file_matches(job, rel, size, record["m"]))) or (
+                _published_matches(record, dest) and _committed_file_matches(job, rel, size, record["m"])):
             return 200, {"path": rel, "size": size}
         stage = next((p for p in (paths["ready"], paths["temp"])
                       if _has_size(p, size)), None)
@@ -963,6 +1116,84 @@ def complete_native_upload(job, body):
         return 200, {"path": rel, "size": size}
 
 
+@_job_operation()
+def finalize_native_upload(job, body):
+    """Publish a terminal native PUT once; retries reconcile the same inode.
+
+    The intent records the synced inode BEFORE rename. If the process dies
+    between rename and journal append, a retry can finish bookkeeping without
+    mistaking an older same-size destination for this attempt. This preserves
+    the existing durability contract; directory/journal group sync is separate.
+    """
+    rel, token = body.get("p"), body.get("token")
+    if not validate_rel(rel) or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        return 400, "原生上传标识非法"
+    dest = safe_join(job["destination"], rel)
+    part = safe_join(job["destination"], rel + PART_SUFFIX)
+    state_path = _native_record_path(job, rel)
+    if dest is None or part is None or state_path is None:
+        return 400, "原生上传路径非法"
+    with _upload_lock(part):
+        record = _load_json(state_path, {})
+        if (not isinstance(record, dict) or record.get("token") != token
+                or record.get("p") != rel
+                or record.get("destination") != job["destination"]
+                or record.get("data_root") != USER_DATA_ROOT
+                or any(record.get(k) != v for k, v in _native_context(job).items())):
+            return 409, "原生上传记录已变化，请重试"
+        size, mtime = record["s"], record["m"]
+        if (record.get("finalized") and not os.path.isfile(part)
+                and _committed_file_matches(job, rel, size, mtime)):
+            # An interrupted v1.6.1 run may already have completed both old calls.
+            return 200, {"path": rel, "size": size, "committed": True}
+        if _published_matches(record, dest):
+            entry = load_manifest(job)["files"].get(rel, {})
+            if entry.get("native_token") == token and entry.get("s") == size and entry.get("m") == mtime:
+                return 200, {"path": rel, "size": size, "committed": True}
+        else:
+            paths = _native_paths(record)
+            if paths is None:
+                return 400, "原生上传临时目录非法"
+            candidates = [paths["ready"], paths["temp"]]
+            if record.get("finalized"):
+                candidates.append(part)  # v1.6.1 complete succeeded before upgrade
+            stage, fileobj, staged_stat = None, None, None
+            for candidate in candidates:
+                try:
+                    fd = os.open(candidate, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                                 | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+                except FileNotFoundError:
+                    continue
+                f = os.fdopen(fd, "r+b")
+                try:
+                    st = os.fstat(f.fileno())
+                    if stat.S_ISREG(st.st_mode) and st.st_size == size:
+                        stage, fileobj, staged_stat = candidate, f, st
+                        break
+                except BaseException:
+                    f.close()
+                    raise
+                f.close()
+            if fileobj is None:
+                # Record terminal status only once; a partial PUT is never published.
+                if not record.get("settled"):
+                    record["settled"] = True
+                    _save_json(state_path, record)
+                return 409, {"reason": "native_incomplete", "message": "原生上传数据不完整，可再次继续备份"}
+            with fileobj as f:
+                _set_native_owner(f.fileno(), staged_stat)
+                # Set attributes before the sole file fsync, rather than after it.
+                os.utime(f.fileno() if os.utime in os.supports_fd else stage,
+                         ns=(mtime * 1000000, mtime * 1000000))
+                os.fsync(f.fileno())
+                record.update(settled=True, publishing=_published_identity(os.fstat(f.fileno())))
+                _save_json(state_path, record)
+            os.replace(stage, dest)
+        manifest_upsert(job, [(rel, {"s": size, "m": mtime, "t": int(time.time()), "native_token": token})])
+        return 200, {"path": rel, "size": size, "committed": True}
+
+
+@_job_operation()
 def commit_file(job, rel, size, mtime):
     """.part → 正式文件：原子替换、保留修改时间、记清单。"""
     destf = safe_join(job["destination"], rel)
@@ -992,6 +1223,7 @@ def commit_file(job, rel, size, mtime):
     return 200, {"path": rel, "size": actual}
 
 
+@_job_operation(exclusive=True)
 def tombstone(job, paths, mode="del"):
     """处理 PC 端已删除的文件。
     mode="del"（默认）：改名为 <原名>.del，数据保留；已有 .del 则覆盖为最新版本。
@@ -1031,6 +1263,7 @@ def tombstone(job, paths, mode="del"):
     return 200, results
 
 
+@_job_operation(exclusive=True)
 def prune_excluded(job):
     """彻底删除因排除规则移出管理的备份文件（用户在界面显式触发，不可恢复）。"""
     with _job_lock(job["id"]):
@@ -1187,12 +1420,14 @@ def create_job(body):
     return 200, {"id": jid}
 
 
+@_job_operation(exclusive=True)
 def update_job(jid, body):
     with _JOBS_LOCK:
         jobs = load_jobs()
         if jid not in jobs:
             return 404, "任务不存在"
         job = jobs[jid]
+        old_identity = {k: job.get(k) for k in ("destination", "exclude", "pc_path")}
         if "name" in body and str(body["name"]).strip():
             job["name"] = str(body["name"]).strip()
         if "dest_sub" in body or "destination" in body:
@@ -1215,9 +1450,13 @@ def update_job(jid, body):
                 return 400, "pc_path 非法"
             job["pc_path"] = pc_path
         save_jobs(jobs)
+        if any(job.get(k) != v for k, v in old_identity.items()):
+            _rotate_native_generation(job)
+            _MANIFEST_PATH_CACHE.pop(jid, None)
     return 200, "ok"
 
 
+@_job_operation(exclusive=True)
 def delete_job(jid, purge):
     with _JOBS_LOCK:
         jobs = load_jobs()
@@ -1482,6 +1721,8 @@ class Handler(BaseHTTPRequestHandler):
                         code, data = prepare_native_upload(job, body)
                     elif action == "complete":
                         code, data = complete_native_upload(job, body)
+                    elif action == "finalize":
+                        code, data = finalize_native_upload(job, body)
                     else:
                         code, data = 400, "原生上传操作非法"
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)

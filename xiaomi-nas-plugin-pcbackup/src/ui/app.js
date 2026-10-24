@@ -696,7 +696,18 @@
         if (e && (e.cancelled || e.status === 409 || e.status === 400)) throw e;
         if (state.cancel || attempt >= RETRY_MAX) throw e;
         log("第 " + attempt + " 次重试 " + label + "：" + e.message, "lg-err");
-        return new Promise(function (r) { setTimeout(r, 1000 * Math.pow(2, attempt)); }).then(tryOnce);
+        return new Promise(function (resolve, reject) {
+          var timer;
+          function clear() {
+            clearTimeout(timer);
+            var index = _activeRequests.indexOf(cancel);
+            if (index >= 0) _activeRequests.splice(index, 1);
+          }
+          function cancel() { clear(); reject({ cancelled: true }); }
+          if (state.cancel) { cancel(); return; }
+          _activeRequests.push(cancel);
+          timer = setTimeout(function () { clear(); resolve(); }, 1000 * Math.pow(2, attempt));
+        }).then(tryOnce);
       });
     }
     return tryOnce();
@@ -847,6 +858,7 @@
       var ent = state.fileMap[rel];
       var size = ent.size, mtime = ent.mtime;
       var isNative = state.sourcePath && !ent.file && !getPcFs();
+      var nativeCommitted = false;
       var url = "api/jobs/" + job.id + "/data?path=" + encodeURIComponent(rel) + "&offset=";
       var checkSource = ((state.isResuming && !isNative) || (isNative && size === 0))
         ? nativeStat(getBridge(), ent.abs, true).then(function (st) {
@@ -896,6 +908,7 @@
             return uploadViaNative(job, ent, rel, size, mtime, offset,
               function (p) { speedProbe.tick(p); })
               .then(function () {
+                nativeCommitted = true;
                 speedProbe.settle();
                 doneBytes += size - offset;
                 setProgress("上传中", rel);
@@ -924,6 +937,7 @@
           return chunkLoop(offset);
         })
         .then(function () {
+          if (nativeCommitted) return;
           return withRetry(function () {
             return api("POST", "api/jobs/" + job.id + "/commit", { p: rel, s: size, m: mtime });
           }, "确认文件 " + rel);
@@ -1385,13 +1399,17 @@
       if (state.cancel) return Promise.reject({ cancelled: true });
       return nativeStat(bridge, ent.abs, true).then(function (st) {
         if (st.size !== size || Math.abs(Math.floor(st.mtimeMs) - mtime) > 1) {
-          throw new Error("PC 文件已变化，请重新扫描目录");
+          var changed = new Error("PC 文件已变化，请重新扫描目录");
+          changed.status = 409;
+          throw changed;
         }
       });
     }
     return checkSource().then(function () {
-      return api("POST", "api/jobs/" + job.id + "/native-upload",
-        { action: "prepare", p: rel, s: size, m: mtime, source: ent.abs });
+      return withRetry(function () {
+        return api("POST", "api/jobs/" + job.id + "/native-upload",
+          { action: "prepare", p: rel, s: size, m: mtime, source: ent.abs, run_id: state.resumeRunId || "" });
+      }, "准备原生上传 " + rel);
     }).then(function (prepared) {
       info = prepared;
       if (!info || !/^[0-9a-f]{32}$/.test(info.token)) throw new Error("原生上传准备响应无效，请更新插件");
@@ -1416,11 +1434,19 @@
             nativeError = e; // A full PUT can still be reconciled after MOVE failed.
           });
       });
-    }).then(checkSource).then(function () {
-      return api("POST", "api/jobs/" + job.id + "/native-upload",
-        { action: "complete", p: rel, token: info.token }).catch(function (e) {
+    }).then(function () {
+      return withRetry(function () {
+        return checkSource().then(function () {
+          return api("POST", "api/jobs/" + job.id + "/native-upload",
+            { action: "finalize", p: rel, token: info.token });
+        });
+      }, "确认原生文件 " + rel).then(function (result) {
+        if (!result || !result.committed) throw new Error("原生上传确认响应无效，请更新插件");
+        return result;
+      }).catch(function (e) {
           if (e.cancelled) throw e;
-          throw new Error((nativeError ? nativeError.message + "；" : "") + e.message);
+          if (nativeError) e.message = nativeError.message + "；" + e.message;
+          throw e;
         });
     });
   }

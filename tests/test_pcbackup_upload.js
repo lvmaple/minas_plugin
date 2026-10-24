@@ -66,6 +66,7 @@ function harness(options = {}) {
       data = { token, temp_name: `pcb_${token}.temptd_1`, ready_name: `pcb_${token}.ready`, uploaded: false };
     }
     if (url.endsWith('/jobs')) data = [];
+    if (url.endsWith('/native-upload') && body.action === 'finalize') data = { committed: true };
     return Promise.resolve(response({ code: 0, data }));
   }
   class Xhr {
@@ -247,17 +248,157 @@ test('native MOVE failure reconciles staged data without bridge PC reads', async
   assert.ok(h.native[0].task.realdpath.startsWith('/pool0/data/.temp_upload_dir/'));
   h.native[0].fail({ code: -1 });
   await p;
-  assert.ok(h.requests.some(r => r.opt.body && JSON.parse(r.opt.body).action === 'complete'));
+  assert.ok(h.requests.some(r => r.opt.body && JSON.parse(r.opt.body).action === 'finalize'));
   assert.equal(Object.keys(h.transfers).length, 0);
   assert.equal(h.timers.size, 0);
 });
 
 test('recovering a complete NAS stage avoids sending the PC file again', async () => {
   const h = harness({ fetch: async (url, opt, response) => response({ code: 0,
-    data: opt.body && JSON.parse(opt.body).action === 'prepare' ? { token: 'b'.repeat(32), uploaded: true } : {} }) });
+    data: opt.body && JSON.parse(opt.body).action === 'prepare' ? { token: 'b'.repeat(32), uploaded: true } : { committed: true } }) });
   await h.uploadViaNative(job, entry, 'a.txt', 5, 1000, 0, () => {});
   assert.equal(h.native.length, 0);
   assert.equal(h.requests.filter(r => r.url.includes('get_pool_info')).length, 0);
+});
+
+test('lost finalize acknowledgement retries the same token without uploading again', async () => {
+  const confirms = [];
+  const h = harness({ fetch: (url, opt, response) => {
+    if (opt.body && JSON.parse(opt.body).action === 'finalize') {
+      confirms.push(JSON.parse(opt.body));
+      if (confirms.length === 1) return Promise.reject(new Error('connection lost after commit'));
+      return Promise.resolve(response({ code: 0, data: { committed: true } }));
+    }
+  } });
+  const p = h.uploadViaNative(job, entry, 'a.txt', 5, 1000, 0, () => {});
+  await until(() => h.native.length === 1);
+  h.native[0].done({}); await flush();
+  assert.equal(confirms.length, 1);
+  h.clock.tick(2000); await p;
+  assert.equal(confirms.length, 2);
+  assert.equal(confirms[0].token, confirms[1].token);
+  assert.equal(h.native.length, 1);
+  assert.equal(h.timers.size, 0);
+});
+
+test('cancelling during finalize retry delay settles immediately and ignores late callbacks', async () => {
+  let confirms = 0;
+  const h = harness({ fetch: (url, opt) => {
+    if (opt.body && JSON.parse(opt.body).action === 'finalize') {
+      confirms++; return Promise.reject(new Error('temporary failure'));
+    }
+  } });
+  const p = h.uploadViaNative(job, entry, 'a.txt', 5, 1000, 0, () => {});
+  const rejected = assert.rejects(p, e => e.cancelled === true);
+  await until(() => h.native.length === 1);
+  h.native[0].done({}); await flush();
+  assert.equal(confirms, 1);
+  h.state.cancel = true; h.abortAllUploads(); await rejected;
+  h.native[0].done({}); h.clock.tick(10000); await flush();
+  assert.equal(confirms, 1);
+  assert.equal(h.timers.size, 0);
+});
+
+test('cancel while finalize is in flight preserves run identity and ignores its late response', async () => {
+  let acknowledge, signal;
+  const h = harness({ fetch: (url, opt, response) => {
+    if (opt.body && JSON.parse(opt.body).action === 'finalize') {
+      signal = opt.signal;
+      return new Promise(resolve => { acknowledge = () => resolve(response({ code: 0, data: { committed: true } })); });
+    }
+  } });
+  Object.assign(h.state, { job, plan: { upload: [['a.txt', 5]], upload_bytes: 5, deleted: [] },
+    resumeRunId: 'saved-run', sourcePath: 'D:\\docs', fileMap: { 'a.txt': entry } });
+  h.runUploadActive(); await until(() => h.native.length === 1);
+  h.native[0].done({}); await until(() => acknowledge);
+  h.state.cancel = true; h.abortAllUploads(); await until(() => !h.state.running);
+  assert.equal(signal.aborted, true);
+  const finish = JSON.parse(h.requests.find(r => r.url.endsWith('/finish')).opt.body);
+  assert.equal(finish.cancelled, true);
+  assert.equal(finish.run_id, 'saved-run');
+  assert.equal(finish.uploaded, 0);
+  acknowledge(); await flush();
+  assert.equal(h.requests.filter(r => r.url.endsWith('/commit')).length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test('source metadata change blocks finalize without retrying a different PC file', async () => {
+  const h = harness();
+  let stats = 0;
+  h.bridge.getPcFileStats = (info, done) => done({ size: 5, mtimeMs: ++stats === 1 ? 1000 : 2000 });
+  const p = h.uploadViaNative(job, entry, 'a.txt', 5, 1000, 0, () => {});
+  const rejected = assert.rejects(p, /PC 文件已变化/);
+  await until(() => h.native.length === 1); h.native[0].done({}); await rejected;
+  assert.equal(h.requests.filter(r => r.opt.body && JSON.parse(r.opt.body).action === 'finalize').length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test('a stale finalize token is surfaced once without retry or chunk fallback', async () => {
+  let confirms = 0;
+  const h = harness({ fetch: (url, opt) => {
+    if (opt.body && JSON.parse(opt.body).action === 'finalize') {
+      confirms++;
+      return Promise.resolve({ ok: false, status: 409, json: async () => ({ message: 'stale token' }) });
+    }
+  } });
+  const p = h.uploadViaNative(job, entry, 'a.txt', 5, 1000, 0, () => {});
+  const rejected = assert.rejects(p, e => e.status === 409);
+  await until(() => h.native.length === 1); h.native[0].done({}); await rejected;
+  assert.equal(confirms, 1);
+  assert.equal(h.xhrs.length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test('exhausted finalize retries keep the same token and never re-upload', async () => {
+  const tokens = [];
+  const h = harness({ fetch: (url, opt) => {
+    if (opt.body && JSON.parse(opt.body).action === 'finalize') {
+      tokens.push(JSON.parse(opt.body).token);
+      return Promise.reject(new Error('NAS unavailable'));
+    }
+  } });
+  const p = h.uploadViaNative(job, entry, 'a.txt', 5, 1000, 0, () => {});
+  const rejected = assert.rejects(p, /NAS unavailable/);
+  await until(() => h.native.length === 1); h.native[0].done({}); await flush();
+  h.clock.tick(2000); await flush();
+  h.clock.tick(4000); await rejected;
+  assert.equal(tokens.length, 3);
+  assert.equal(new Set(tokens).size, 1);
+  assert.equal(h.native.length, 1);
+  assert.equal(h.timers.size, 0);
+});
+
+test('empty native files retain the chunk commit path', async () => {
+  const h = harness();
+  h.bridge.getPcFileStats = (info, done) => done({ size: 0, mtimeMs: 1000 });
+  Object.assign(h.state, { job, plan: { upload: [['empty.txt', 0]], upload_bytes: 0, deleted: [] },
+    sourcePath: 'D:\\docs', fileMap: { 'empty.txt': { ...entry, size: 0 } } });
+  h.runUploadActive(); await until(() => h.xhrs.length === 1);
+  h.xhrs[0].status = 200; h.xhrs[0].onload(); await until(() => !h.state.running); await flush();
+  assert.equal(h.native.length, 0);
+  assert.equal(h.requests.filter(r => r.url.endsWith('/commit')).length, 1);
+  assert.equal(h.requests.filter(r => r.opt.body && JSON.parse(r.opt.body).action === 'finalize').length, 0);
+  assert.equal(h.timers.size, 0);
+});
+
+test('six slots stay occupied until finalize acknowledgement', async () => {
+  const pending = [];
+  const h = harness({ fetch: (url, opt, response) => {
+    if (opt.body && JSON.parse(opt.body).action === 'finalize') {
+      return new Promise(resolve => pending.push(() => resolve(response({ code: 0, data: { committed: true } }))));
+    }
+  } });
+  const upload = Array.from({ length: 8 }, (_, i) => [`file-${i}.txt`, 5]);
+  Object.assign(h.state, { job, plan: { upload, upload_bytes: 40, deleted: [] }, sourcePath: 'D:\\docs',
+    fileMap: Object.fromEntries(upload.map(([p]) => [p, entry])) });
+  h.runUploadActive(); await until(() => h.native.length === 6);
+  h.native.slice(0, 6).forEach(n => n.done({})); await until(() => pending.length === 6);
+  assert.equal(h.native.length, 6);
+  pending[0](); await until(() => h.native.length === 7);
+  assert.equal(h.native.length, 7);
+  h.state.cancel = true; h.abortAllUploads(); await until(() => !h.state.running);
+  await flush();
+  assert.equal(h.timers.size, 0);
 });
 
 test('native idle timeout stops the task and does not promote an uncertain PUT', async () => {
@@ -268,7 +409,7 @@ test('native idle timeout stops the task and does not promote an uncertain PUT',
   assert.equal(h.pauses.length, 1);
   assert.equal(h.pauses[0].callback, 'function');
   assert.equal(Object.keys(h.transfers).length, 0);
-  assert.ok(!h.requests.some(r => r.opt.body && JSON.parse(r.opt.body).action === 'complete'));
+  assert.ok(!h.requests.some(r => r.opt.body && JSON.parse(r.opt.body).action === 'finalize'));
   h.native[0].done({ size: 5, mtimeMs: 1000 }); await flush();
   assert.equal(h.timers.size, 0, 'late callback must not restart or retain a task');
 });
@@ -365,8 +506,9 @@ test('the actual upload runner completes 2001 native files after all directory b
   assert.ok(maxActive <= 6);
   const requests = h.requests.filter(r => r.opt.body).map(r => ({ url: r.url, ...JSON.parse(r.opt.body) }));
   assert.deepEqual(requests.filter(r => r.url.endsWith('/mkdirs')).map(r => r.paths.length), [2000, 1]);
-  assert.equal(requests.filter(r => r.action === 'complete').length, 2001);
-  assert.equal(requests.filter(r => r.url.endsWith('/commit')).length, 2001);
+  assert.equal(requests.filter(r => r.action === 'finalize').length, 2001);
+  assert.equal(requests.filter(r => r.action === 'complete').length, 0);
+  assert.equal(requests.filter(r => r.url.endsWith('/commit')).length, 0);
   const finish = requests.find(r => r.url.endsWith('/finish'));
   assert.equal(finish.uploaded, 2001);
   assert.equal(finish.failed, 0);
