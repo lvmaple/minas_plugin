@@ -34,6 +34,7 @@ class TransferTests(unittest.TestCase):
         backend._MANIFEST_PATH_CACHE.clear()
         backend._RUN_CURRENT.clear()
         backend._SCAN_STATE.clear()
+        backend._RESUME_ID_CACHE.clear()
         self.job = {"id": "1234abcd", "name": "test", "destination": str(self.root / "pool/backup")}
         Path(self.job["destination"]).mkdir(parents=True)
         backend.save_jobs({self.job["id"]: self.job})
@@ -205,6 +206,145 @@ class TransferTests(unittest.TestCase):
             "deleted": [], "skipped": 0, "repaired": 0, "adopted": 0, "excluded_kept": 0,
             "del_mode": "del", "prune_excluded": False})
 
+    def save_large_checkpoint(self):
+        self.save_checkpoint()
+        record = backend.load_resume(self.job)
+        record["files"] = [[self.body["p"], 5, self.body["m"]]] + [
+            ["performance/" + "nested-directory/" * 8 + "%06d-sample-document.txt" % n,
+             5, self.body["m"]] for n in range(49999)]
+        record["total_files"] = 50000
+        backend._save_json(backend.resume_path(self.job), record)
+        return record
+
+    def test_50000_file_checkpoint_is_not_parsed_per_native_context(self):
+        self.save_large_checkpoint()
+        self.assertGreater(Path(backend.resume_path(self.job)).stat().st_size, 8 * 1024 * 1024)
+        with patch.object(backend, "load_resume", wraps=backend.load_resume) as load:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                contexts = list(pool.map(lambda _: backend._native_context(self.job), range(6)))
+            self.assertTrue(all(c["run_id"] == "saved-run" for c in contexts))
+            self.assertLessEqual(load.call_count, 1, "six files must share one cold checkpoint read")
+            load.reset_mock()
+            for _ in range(100):
+                self.assertEqual(backend._native_context(self.job), contexts[0])
+            self.assertEqual(load.call_count, 0, "warm file operations must never parse the full plan")
+
+    def test_50000_file_plan_six_workers_publish_and_retry_without_reparsing(self):
+        record = self.save_large_checkpoint()
+        bodies = [dict(self.body, p=p, s=s, m=m) for p, s, m in record["files"][:36]]
+
+        def upload(body):
+            info = self.prepare(body)
+            self.stage(info, ready=True)
+            first = self.finalize(info, body)
+            retry = self.finalize(info, body)  # acknowledgement lost
+            self.assertEqual(first[0], 200)
+            self.assertEqual(retry, first)
+            return info
+
+        with patch.object(backend, "load_resume", wraps=backend.load_resume) as load:
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                infos = list(pool.map(upload, bodies))
+            self.assertEqual(len(infos), 36)
+            self.assertEqual(load.call_count, 1, "all prepare/finalize/retry requests share one cold read")
+        self.assertEqual(len(backend.load_manifest(self.job)["files"]), 36)
+        # Cache contains only a stamp and scalar run ID, never the 50,000 entries.
+        cached = backend._RESUME_ID_CACHE[self.job["id"]]
+        self.assertEqual(cached[1], "saved-run")
+        self.assertLess(len(repr(cached)), 1024)
+
+    def test_50000_file_plan_cancel_and_restart_keep_progress_and_staged_data(self):
+        record = self.save_large_checkpoint()
+        first = self.prepare()
+        self.stage(first)
+        self.assertEqual(self.finalize(first)[0], 200)
+        ready_body = dict(self.body, p=record["files"][1][0])
+        ready = self.prepare(ready_body)
+        self.stage(ready, ready=True)
+        partial_body = dict(self.body, p=record["files"][2][0])
+        partial = self.prepare(partial_body)
+        self.stage(partial, b"he")
+        self.assertEqual(backend.finish_run(self.job, {"run_id": "saved-run", "cancelled": True})[1]["status"], "cancelled")
+        with patch.object(backend, "load_resume", wraps=backend.load_resume) as load:
+            self.assertEqual(backend._native_context(self.job)["run_id"], "saved-run")
+            self.assertEqual(load.call_count, 0, "cancellation must retain the current identity")
+        backend._RESUME_ID_CACHE.clear()
+        backend._MANIFEST_CACHE.clear()
+        status = backend.resume_status(self.job)[1]
+        self.assertEqual(status["plan"]["previous_uploaded"], 1)
+        self.assertEqual(len(status["files"]), 49999)
+        recovered = self.prepare(ready_body)
+        self.assertEqual(recovered["token"], ready["token"])
+        self.assertTrue(recovered["uploaded"])
+        self.assertEqual(self.finalize(recovered, ready_body)[0], 200)
+        new_partial = self.prepare(partial_body)
+        self.assertNotEqual(new_partial["token"], partial["token"])
+        self.assertEqual(self.finalize(partial, partial_body)[0], 409)
+        self.stage(new_partial)
+        self.assertEqual(self.finalize(new_partial, partial_body)[0], 200)
+
+    def test_cached_run_id_detects_checkpoint_replacement_and_removal(self):
+        record = self.save_large_checkpoint()
+        info = self.prepare()
+        self.stage(info, ready=True)
+        record["run_id"] = "replacement-run"
+        backend._save_json(backend.resume_path(self.job), record)
+        with patch.object(backend, "load_resume", wraps=backend.load_resume) as load:
+            self.assertEqual(self.finalize(info)[0], 409)
+            self.assertEqual(load.call_count, 1)
+            self.assertEqual(backend._native_context(self.job)["run_id"], "replacement-run")
+            self.assertEqual(load.call_count, 1)
+        os.remove(backend.resume_path(self.job))
+        with patch.object(backend, "load_resume", wraps=backend.load_resume) as load:
+            self.assertEqual(backend._native_context(self.job)["run_id"], "")
+            self.assertEqual(load.call_count, 0)
+        self.assertEqual(self.finalize(info)[0], 409)
+
+    def test_checkpoint_read_failure_is_retried_without_caching_an_empty_run(self):
+        self.save_checkpoint()
+        with patch.object(backend, "load_resume", return_value=None):
+            with self.assertRaises(OSError):
+                backend._native_context(self.job)
+        self.assertNotIn(self.job["id"], backend._RESUME_ID_CACHE)
+        self.assertEqual(backend._native_context(self.job)["run_id"], "saved-run")
+
+    def test_checkpoint_replaced_during_cold_read_is_not_cached(self):
+        self.save_checkpoint()
+        original = backend.load_resume
+
+        def replace_during_read(job):
+            old = original(job)
+            backend._save_json(backend.resume_path(job), dict(old, run_id="replacement-run"))
+            return old
+
+        with patch.object(backend, "load_resume", side_effect=replace_during_read):
+            with self.assertRaises(OSError):
+                backend._native_context(self.job)
+        self.assertNotIn(self.job["id"], backend._RESUME_ID_CACHE)
+        self.assertEqual(backend._native_context(self.job)["run_id"], "replacement-run")
+
+    def test_start_resume_seeds_small_identity_and_successful_finish_invalidates_it(self):
+        backend.manifest_meta(self.job, "docs")
+        backend._native_context(self.job)  # initialize generation before creating the plan
+        backend._SCAN_STATE[self.job["id"]] = {
+            "phase": "done", "scan_id": "new-scan", "destination": self.job["destination"], "exclude": [],
+            "incoming": {self.body["p"]: (5, self.body["m"])},
+            "plan": {"folder": "docs", "total_files": 1, "upload": [[self.body["p"], 5]],
+                     "deleted": [], "skipped": 0, "repaired": 0, "adopted": 0, "excluded_kept": 0}}
+        body = {"scan_id": "new-scan", "source_path": r"D:\documents"}
+        code, started = backend.start_resume(self.job, body)
+        self.assertEqual(code, 200)
+        self.assertEqual(backend.start_resume(self.job, body)[1]["run_id"], started["run_id"])
+        with patch.object(backend, "load_resume", side_effect=AssertionError("new plan must already be cached")):
+            self.assertEqual(backend._native_context(self.job)["run_id"], started["run_id"])
+        info = self.prepare()
+        self.stage(info)
+        self.assertEqual(self.finalize(info)[0], 200)
+        self.assertEqual(backend.finish_run(self.job, {"run_id": started["run_id"]})[1]["status"], "ok")
+        self.assertFalse(Path(backend.resume_path(self.job)).exists())
+        self.assertEqual(backend._native_context(self.job)["run_id"], "")
+        self.assertEqual(self.finalize(info)[0], 409)
+
     def test_cancelled_finish_drains_inflight_finalize_and_resume_skips_it(self):
         self.save_checkpoint()
         info = self.prepare()
@@ -280,6 +420,7 @@ class TransferTests(unittest.TestCase):
                 self.assertIn(self.finalize(info)[0], (404, 409))
 
     def test_process_exit_at_publish_boundaries_recovers_from_disk(self):
+        self.save_large_checkpoint()
         script = r'''
 import importlib.util,json,os,sys
 spec=importlib.util.spec_from_file_location("crash_backend",sys.argv[1])

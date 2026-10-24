@@ -31,7 +31,7 @@ except ImportError:
     pwd = None
 
 PORT = int(os.environ.get("PLUG_PORT", "9303"))
-PLUGIN_VERSION = "1.6.2"
+PLUGIN_VERSION = "1.6.3"
 _FILES_DIR = os.path.dirname(os.path.abspath(__file__))          # <plugin>/src/files
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(_FILES_DIR))       # <plugin>/
 DATA_DIR = os.environ.get("PCBACKUP_DATA") or os.path.join(PLUGIN_ROOT, "etc")
@@ -39,6 +39,7 @@ JOBS_DIR = os.path.join(DATA_DIR, "jobs")
 JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 RESUME_FILENAME = "pending-run.json"
+_RESUME_ID_CACHE = {}             # jid -> (checkpoint stamp, run_id); never keep the file list
 
 PLUG_USER = os.environ.get("PLUG_USER", "")
 # 用户在 App「我的数据」里对应的根目录（任务只需填这下面的子目录）
@@ -562,6 +563,43 @@ def load_resume(job):
     return record if isinstance(record, dict) and record.get("version") == 1 else None
 
 
+def _resume_stamp(job):
+    path = resume_path(job)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return (path, None)
+    return (path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _remember_resume_id(job, record):
+    """Caller holds the job lock; cache only the identity of an installed plan."""
+    _RESUME_ID_CACHE[job["id"]] = (_resume_stamp(job), record["run_id"] if record else "")
+
+
+def _resume_run_id(job):
+    """O(1) hot path. A cold start/replaced checkpoint is decoded at most once.
+
+    The stamp also detects atomic replacement or removal outside our lifecycle
+    helpers, so retaining a cached ID cannot authorize a stale native attempt.
+    Caller holds the job lock; concurrent files share the single cold load.
+    """
+    stamp = _resume_stamp(job)
+    cached = _RESUME_ID_CACHE.get(job["id"])
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    record = load_resume(job) if stamp[1] is not None else None
+    if _resume_stamp(job) != stamp:
+        raise OSError("续传记录正在变化，请重试")
+    if stamp[1] is not None and record is None:
+        # A transient read/decode failure must not poison this stamp with an
+        # empty ID and reject every later request until the file changes.
+        raise OSError("无法读取续传记录，请重试")
+    run_id = record["run_id"] if record else ""
+    _RESUME_ID_CACHE[job["id"]] = (stamp, run_id)
+    return run_id
+
+
 def resume_status(job):
     """Only inspect files in the saved upload plan; never rescan the PC tree."""
     with _job_lock(job["id"]):
@@ -650,6 +688,7 @@ def start_resume(job, body):
             "prune_excluded": bool(body.get("prune_excluded")),
         }
         _save_json(resume_path(job), record)
+        _remember_resume_id(job, record)
         return resume_status(job)
 
 
@@ -665,6 +704,7 @@ def finish_run(job, stats):
             if previous:
                 if record and record.get("run_id") == run_id:
                     os.remove(resume_path(job))
+                    _RESUME_ID_CACHE.pop(job["id"], None)
                 return 200, previous
             if not record or record.get("run_id") != run_id:
                 return 409, "续传记录已变化，请刷新任务"
@@ -703,6 +743,7 @@ def finish_run(job, stats):
                 save_jobs(jobs)
         if run_id and complete:
             os.remove(resume_path(job))
+            _RESUME_ID_CACHE.pop(job["id"], None)
         return 200, entry
 
 
@@ -989,6 +1030,7 @@ def _committed_file_matches(job, rel, size, mtime):
 
 def _rotate_native_generation(job):
     _save_json(os.path.join(job_dir(job["id"]), "native-generation.json"), uuid.uuid4().hex)
+    _RESUME_ID_CACHE.pop(job["id"], None)
 
 
 def _native_context(job):
@@ -998,8 +1040,7 @@ def _native_context(job):
         if not generation:
             _rotate_native_generation(job)
             generation = _load_json(path, None)
-        resume = load_resume(job)
-        return {"generation": generation, "run_id": resume["run_id"] if resume else ""}
+        return {"generation": generation, "run_id": _resume_run_id(job)}
 
 
 def _published_identity(st):
@@ -1485,6 +1526,7 @@ def delete_job(jid, purge):
     with _job_lock(jid):
         _MANIFEST_CACHE.pop(jid, None)
         _RUN_CURRENT.pop(jid, None)
+        _RESUME_ID_CACHE.pop(jid, None)
     import shutil
     shutil.rmtree(job_dir(jid), ignore_errors=True)
     if purge:
