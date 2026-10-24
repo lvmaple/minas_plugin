@@ -11,6 +11,10 @@
   var BRIDGE_MAX_FILE = 64 * 1024 * 1024;
   var RETRY_MAX = 3;
   var LOG_KEEP = 400;
+  var API_TIMEOUT_MS = 60000;
+  var NATIVE_IDLE_MS = 120000;
+  var NATIVE_TOTAL_MS = 6 * 60 * 60 * 1000;
+  var MKDIRS_BATCH_MAX = 2000;
   var DEFAULT_EXCLUDES = [
     "Thumbs.db", "desktop.ini", ".DS_Store", "~$*",
     "node_modules/", ".pnpm-store/", ".venv/", "venv/", ".gradle/",
@@ -71,21 +75,59 @@
     return base + "/" + ep;
   }
 
+  var _activeRequests = [];
+  function requestJson(url, opt, cancellable) {
+    return new Promise(function (resolve, reject) {
+      var controller = new AbortController(), done = false;
+      var timer;
+      function finish(fn, value) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        var index = _activeRequests.indexOf(cancel);
+        if (index >= 0) _activeRequests.splice(index, 1);
+        fn(value);
+      }
+      function cancel() {
+        finish(reject, { cancelled: true });
+        controller.abort();
+      }
+      if (cancellable) {
+        if (state.cancel) { cancel(); return; }
+        _activeRequests.push(cancel);
+      }
+      opt.signal = controller.signal;
+      timer = setTimeout(function () {
+        finish(reject, new Error("服务端请求超时，请检查连接后继续备份"));
+        controller.abort();
+      }, API_TIMEOUT_MS);
+      Promise.resolve().then(function () { return fetch(url, opt); }).then(function (r) {
+        return r.json().then(function (j) {
+          if (!r.ok) {
+            var err = new Error(j.message || ("HTTP " + r.status));
+            err.status = r.status; err.code = j.code; err.data = j.data;
+            throw err;
+          }
+          return j;
+        });
+      }).then(function (j) { finish(resolve, j); }, function (e) { finish(reject, e); });
+    });
+  }
+
   function api(method, ep, body) {
     var opt = { method: method, cache: "no-store" };
     if (body !== undefined) {
       opt.headers = { "Content-Type": "application/json" };
       opt.body = JSON.stringify(body);
     }
-    return fetch(apiUrl(ep), opt).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (j) {
-        if (!r.ok || (j.code !== undefined && j.code !== 0)) {
-          var err = new Error(j.message || ("HTTP " + r.status));
+    var cancellable = state.running && /\/(part|commit|mkdirs|native-upload|deleted)(?:\?|$)/.test(ep);
+    return requestJson(apiUrl(ep), opt, cancellable).then(function (j) {
+        if (j.code !== undefined && j.code !== 0) {
+          var err = new Error(j.message || ("服务端错误 " + j.code));
           err.code = j.code; err.data = j.data;
           throw err;
         }
         return j.data;
-      });
     });
   }
 
@@ -597,8 +639,13 @@
   // 服务端 .part 截断引发 409 连锁）
   var _activeXhrs = [];
   function abortAllUploads() {
-    _activeXhrs.forEach(function (x) { try { x.abort(); } catch (e) {} });
+    var xhrs = _activeXhrs.slice();
     _activeXhrs = [];
+    xhrs.forEach(function (x) { try { x.abort(); } catch (e) {} });
+    _activeRequests.slice().forEach(function (cancel) { cancel(); });
+    Object.keys(_nativeTransfers).forEach(function (tag) {
+      _nativeTransfers[tag].stop({ cancelled: true });
+    });
   }
 
   function xhrPut(url, blob, onProgress) {
@@ -614,8 +661,13 @@
         fn(arg);
       }
       xhr.open("PUT", apiUrl(url));
-      xhr.timeout = 0;
-      xhr.upload.onprogress = function (ev) { if (onProgress) onProgress(ev.loaded); };
+      xhr.timeout = 5 * 60 * 1000;
+      var lastLoaded = 0;
+      xhr.upload.onprogress = function (ev) {
+        var delta = Math.max(0, ev.loaded - lastLoaded);
+        lastLoaded = Math.max(lastLoaded, ev.loaded);
+        if (onProgress) onProgress(delta);
+      };
       xhr.onload = function () {
         if (xhr.status >= 200 && xhr.status < 300) settle(resolve);
         else {
@@ -657,6 +709,25 @@
     logBox.appendChild(div);
     while (logBox.childNodes.length > LOG_KEEP) logBox.removeChild(logBox.firstChild);
     logBox.scrollTop = logBox.scrollHeight;
+  }
+
+  function prepareNativeDirectories(job, uploads, progress) {
+    var index = 0, made = 0;
+    function batch() {
+      if (state.cancel) return Promise.reject({ cancelled: true });
+      if (index >= uploads.length) return Promise.resolve({ created: made });
+      var paths = uploads.slice(index, index + MKDIRS_BATCH_MAX).map(function (item) { return item[0]; });
+      return api("POST", "api/jobs/" + job.id + "/mkdirs", { paths: paths }).then(function (result) {
+        if (!result || result.processed !== paths.length) {
+          throw new Error("目录准备未覆盖全部文件，请更新插件后重试");
+        }
+        made += result.created || 0;
+        index += paths.length;
+        if (progress) progress(index, uploads.length);
+        return batch();
+      });
+    }
+    return batch();
   }
 
   function runUpload() {
@@ -717,17 +788,25 @@
     var totalCount = plan.upload.length + okCount;
     var failed = [], delCount = plan.previous_deleted || 0;
     var speed = { last: t0, bytes: 0, val: 0 };
+    var paintTimer = null, lastPaint = -1000, pendingPhase = "", pendingFile;
 
-    function setProgress(phase, curFile) {
+    function paintProgress() {
+      clearTimeout(paintTimer); paintTimer = null; lastPaint = Date.now();
       var pct = Math.min(100, doneBytes * 100 / totalBytes);
       $("runBar").style.width = pct.toFixed(1) + "%";
-      var elapsed = (Date.now() - t0) / 1000;
-      $("runPhase").textContent = phase;
+      $("runPhase").textContent = pendingPhase;
       $("runStats").textContent =
         okCount + " / " + totalCount + " 个文件 · " + fmtBytes(doneBytes) + " / " + fmtBytes(totalBytes) +
         " · " + (speed.val ? fmtBytes(speed.val) + "/s" : "…") +
         (speed.val > 0 ? " · 剩余约 " + Math.max(1, Math.round((totalBytes - doneBytes) / speed.val)) + " 秒" : "");
-      if (curFile !== undefined) $("runFile").textContent = curFile || "";
+      if (pendingFile !== undefined) $("runFile").textContent = pendingFile || "";
+    }
+    function setProgress(phase, curFile, force) {
+      var changed = phase !== pendingPhase;
+      pendingPhase = phase;
+      if (curFile !== undefined) pendingFile = curFile;
+      if (force || changed || Date.now() - lastPaint >= 200) paintProgress();
+      else if (paintTimer === null) paintTimer = setTimeout(paintProgress, 200);
     }
     setProgress("准备…", "");
 
@@ -745,16 +824,17 @@
       var rel = item[0];
       var ent = state.fileMap[rel];
       var size = ent.size, mtime = ent.mtime;
+      var isNative = state.sourcePath && !ent.file && !getPcFs();
       var url = "api/jobs/" + job.id + "/data?path=" + encodeURIComponent(rel) + "&offset=";
-      var checkSource = state.isResuming
-        ? nativeStat(getBridge(), ent.abs).then(function (st) {
+      var checkSource = ((state.isResuming && !isNative) || (isNative && size === 0))
+        ? nativeStat(getBridge(), ent.abs, true).then(function (st) {
             if (st.size !== size || Math.abs(Math.floor(st.mtimeMs) - mtime) > 1) {
               throw new Error("PC 文件已变化，请重新扫描目录");
             }
           })
         : Promise.resolve();
       return checkSource.then(function () {
-        if (state.sourcePath && !state.isResuming) return 0; // 新计划不接旧计划的 .part
+        if (isNative || (state.sourcePath && !state.isResuming)) return 0;
         return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
           .then(function (d) { return (d && d.size && d.size <= size) ? d.size : 0; })
           .catch(function () { return 0; });
@@ -768,26 +848,10 @@
               return xhrPut(url + 0, new Blob([]), null);
             }, rel);
           }
-          // 原生路径无 Node fs：一律 upLoadToNas 主进程直传。
-          // 不要用 getPcFileStream 流式——它的回传频道全局共用且无停止接口：
-          // 一条流失败后主进程仍继续灌数据，僵尸回调会把下一条流的数据/finish 串进来，
-          // 且失败流的 withRetry 会用旧 offset 重放 PUT，把服务端 .part 截断（409 连锁）。
-          // upLoadToNas 是 tag 隔离的（upLoadToNas_progress_<tag>），pauseUpload 可停，单写者无并发冲突。
-          if (state.sourcePath && !ent.file && !getPcFs()) {
-            var b0 = getBridge();
-            if (!b0 || typeof b0.upLoadToNas !== "function") {
-              throw new Error("桌面端缺少原生上传接口，请点「选择文件夹」用浏览器模式");
-            }
+          // Native data stays in an isolated staging file until NAS reconciliation.
+          // Never fall back to the shared, unbounded getPcFileStream channel.
+          if (isNative) {
             log("原生直传 " + fmtBytes(size) + " " + rel, "lg-skip");
-            var uploadTag = "pcb_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8);
-            var cancelWatch = setInterval(function () {
-              if (!state.cancel) return;
-              try {
-                var bb = getBridge();
-                if (bb && typeof bb.pauseUpload === "function") bb.pauseUpload(uploadTag, true);
-              } catch (err) {}
-              clearInterval(cancelWatch);
-            }, 500);
             var speedProbe = (function () {
               var lastSeen = offset || 0;   // 直传回调给累计值，差分后才可进速度统计
               return {
@@ -808,31 +872,12 @@
               };
             })();
             return uploadViaNative(job, ent, rel, size, mtime, offset,
-              function (p) { speedProbe.tick(p); }, uploadTag)
+              function (p) { speedProbe.tick(p); })
               .then(function () {
-                clearInterval(cancelWatch);
                 speedProbe.settle();
                 doneBytes += size - offset;
                 setProgress("上传中", rel);
-              }, function (err) {
-              clearInterval(cancelWatch);
-              if (err && err.cancelled) throw err;
-              // 直传失败不再走 getPcFileStream 降级——该通道主进程会从 start 读到
-              // EOF（无取消/背压），preload 对每个 chunk 打一条 console.warn 并被
-              // 主进程日志转发：降级读大文件= 每秒数千条日志（实测 23s 卷 20MB、
-              // 日志海啸+IPC 饱和把页面拖死）。改为只对账：MOVE 已落好 .part 就补记
-              // 账走 commit，否则标记失败（断点续传下轮重跑）。
-              return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
-                .then(function (d) {
-                  var partSize = (d && d.size && d.size <= size) ? d.size : 0;
-                  if (partSize >= size) {
-                    log("直传中断但服务端已有完整数据，已补记 " + rel, "lg-skip");
-                    doneBytes += size - offset;
-                    return;
-                  }
-                  throw new Error("原生上传失败（可在下轮续传）：" + (err.message || err));
-                });
-            });
+              });
           }
           // 无原生桥（纯浏览器模式）：File 对象切片直读，不经 getPcFileStream
           function chunkLoop(off) {
@@ -857,8 +902,9 @@
           return chunkLoop(offset);
         })
         .then(function () {
-          return api("POST", "api/jobs/" + job.id + "/commit",
-                     { p: rel, s: size, m: mtime });
+          return withRetry(function () {
+            return api("POST", "api/jobs/" + job.id + "/commit", { p: rel, s: size, m: mtime });
+          }, "确认文件 " + rel);
         })
         .then(function () {
           okCount++;
@@ -891,26 +937,20 @@
         return tombstoneAll();
       });
     }
-    // 直传 MOVE 不建父目录（WebDAV rename 语义；桌面 App 端也无自愈——真机实测
-    // 新目录首传 100% ENOENT 500）。上传前一次性让后端预建全部目录，幂等。
+    // Prepare every acknowledged batch before starting native workers.
     if (state.sourcePath && !getPcFs() && plan.upload.length) {
       chain = chain.then(function () {
         setProgress("准备目录…", "");
-        return api("POST", "api/jobs/" + job.id + "/mkdirs",
-          { paths: plan.upload.map(function (item) { return item[0]; }) })
+        return prepareNativeDirectories(job, plan.upload, function (n, total) {
+          setProgress("准备目录…", n + " / " + total);
+        })
           .then(function (r) {
             if (r && r.created) log("已预建 " + r.created + " 个目录", "lg-skip");
-          })
-          .catch(function (e) {
-            log("目录预建失败（将由降级路径自建）：" + e.message, "lg-err");
           });
       });
     }
     chain = chain.then(function () {
-      // 文件间并发 10 路。目录预建修复后 MOVE 失败根因已消除；直传走主进程
-      // 连接池不占浏览器同域连接数，6 路实测稳定，试探 10 路吞吐。
-      // 若出现 PUT 超时/连接重置再回落（App 自身限 3 是保守值，并非硬上限）。
-      var CONCURRENCY = 10;
+      var CONCURRENCY = 3;
       var queue = plan.upload.slice();
       function worker() {
         if (state.cancel || !queue.length) return Promise.resolve();
@@ -929,9 +969,12 @@
       return Promise.all(workers);
     });
 
-    chain.then(function () {
+    chain.catch(function (e) {
+      if (e && e.cancelled) { state.cancel = true; return; }
+      throw e;
+    }).then(function () {
       var elapsed = Date.now() - t0;
-      setProgress(state.cancel ? "已取消" : "完成", "");
+      setProgress(state.cancel ? "已取消" : "完成", "", true);
       return api("POST", "api/jobs/" + job.id + "/finish", {
         run_id: state.resumeRunId,
         uploaded: okCount, uploaded_bytes: doneBytes, skipped: plan.skipped,
@@ -947,6 +990,8 @@
       renderDone(okCount, delCount, failed, plan, state.cancel, Date.now() - t0);
       loadJobs();
     }).catch(function (e) {
+      clearTimeout(paintTimer);
+      $("btnCancel").disabled = true;
       state.running = false;
       toast("备份异常中断：" + (e && e.message || e), true);
     });
@@ -1115,22 +1160,31 @@
     });
   }
 
-  function nativeStat(api, absPath) {
+  function nativeStat(api, absPath, cancellable) {
     return new Promise(function (resolve, reject) {
-      var done = false;
-      function fin(v) {
+      var done = false, timer;
+      function fin(v, error) {
         if (done) return;
         done = true;
-        if (v && typeof v.mtimeMs === "number") resolve(v);
+        clearTimeout(timer);
+        var index = _activeRequests.indexOf(cancel);
+        if (index >= 0) _activeRequests.splice(index, 1);
+        if (error) reject(error);
+        else if (v && typeof v.mtimeMs === "number") resolve(v);
         else reject(new Error("stat 无结果"));
       }
+      function cancel() { fin(null, { cancelled: true }); }
+      if (cancellable) {
+        if (state.cancel) { cancel(); return; }
+        _activeRequests.push(cancel);
+      }
+      timer = setTimeout(function () { fin(null, new Error("stat 超时")); }, 30000);
       try {
         var r = api.getPcFileStats({ filepath: absPath, tag: "st_" + Math.random().toString(36).slice(2, 8) }, fin);
         if (r && typeof r.then === "function") {
-          r.then(function (v) { if (v !== undefined) fin(v); }).catch(function () {});
+          r.then(function (v) { if (v !== undefined) fin(v); }).catch(function (e) { fin(null, e); });
         }
-      } catch (e) { /* 走超时 */ }
-      setTimeout(function () { if (!done) { done = true; reject(new Error("stat 超时")); } }, 30000);
+      } catch (e) { fin(null, e); }
     });
   }
 
@@ -1197,10 +1251,6 @@
     }
   }
 
-  // 桥接接口实际为 (path, start, onData, onEnd, onError)，会一直读到 EOF。
-  // 它没有定长读取或暂停能力，故只作小文件回退，并串行调用以免全局 IPC 事件串流。
-  // （readBridgeChunk/_bridgeReadQueue 已随 getPcFileStream 通道一并废弃删除）
-
   function readPcChunk(api, abs, off, len, size, opts) {
     var fs = getPcFs();
     if (fs) return readNodeChunk(fs, abs, off, len);
@@ -1214,18 +1264,14 @@
     return readPcChunk(getBridge(), ent.abs, off, end - off, ent.size, { allowLargeChunk: true });
   }
 
-  // （已废弃 getPcFileStream 流式上传：全局共用回传频道无法隔离，失败后主进程仍灌数据、僵尸回调串流。原生模式统一走 upLoadToNas 直传。）
-
-  // 流式失败时的兜底：upLoadToNas（主进程 WebDAV 直传）。
-  // dPath 必须落在 .temp_upload_dir/ 下；上传完成后 rename 成目标 .pcbp.part，再走 commit。
   var _webDavCredCache = null;
   function fetchWebDavCreds() {
     if (_webDavCredCache) return _webDavCredCache;
-    _webDavCredCache = fetch("/cgi-bin/luci/filemgr/get_pool_info", {
+    _webDavCredCache = requestJson("/cgi-bin/luci/filemgr/get_pool_info", {
       method: "POST",
       headers: { "Content-Type": "application/json" },
       body: "{}"
-    }).then(function (r) { return r.json(); }).then(function (j) {
+    }, true).then(function (j) {
       var w = j && j.data && j.data.webDAV;
       if (!w) throw new Error("无法获取 WebDAV 凭证");
       return w;
@@ -1236,74 +1282,114 @@
     return _webDavCredCache;
   }
 
-  function uploadViaNative(job, ent, rel, size, mtime, offset, onProgress, forceTag) {
+  var _nativeTransfers = Object.create(null);
+  function nativeNoop() {}
+
+  // The host preload retains upload listeners. Keep only a small tag in its
+  // callbacks; delete the corresponding task state and timers on every exit.
+  function nativeCallbacks(tag) {
+    return {
+      progress: function (p) { var t = _nativeTransfers[tag]; if (t) t.progress(p); },
+      done: function (st) { var t = _nativeTransfers[tag]; if (t) t.finish(null, st); },
+      fail: function (e) {
+        var t = _nativeTransfers[tag];
+        if (t) t.finish(new Error("原生上传失败：" + (e && (e.message || e.code) || e)));
+      }
+    };
+  }
+
+  function waitNativeUpload(bridge, task, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var tag = task.tag, idleTimer, totalTimer, lastBytes = 0, done = false, unsubscribe;
+      function finish(err, stat) {
+        if (done) return;
+        done = true;
+        clearTimeout(idleTimer); clearTimeout(totalTimer);
+        delete _nativeTransfers[tag];
+        if (typeof unsubscribe === "function") { try { unsubscribe(); } catch (e) {} }
+        if (err) reject(err); else resolve(stat);
+      }
+      function stop(err) {
+        err.transportUncertain = true;
+        // Settle independently of an absent/late pause or upload callback.
+        finish(err);
+        try {
+          if (typeof bridge.pauseUpload === "function") bridge.pauseUpload(tag, true, nativeNoop);
+        } catch (e) {}
+      }
+      function timeout() { stop(new Error("原生上传长时间无进展或已超时，可再次继续备份")); }
+      function armIdle() { clearTimeout(idleTimer); idleTimer = setTimeout(timeout, NATIVE_IDLE_MS); }
+      _nativeTransfers[tag] = {
+        finish: finish, stop: stop,
+        progress: function (p) {
+          var bytes = p && p.transferred;
+          if (typeof bytes === "number" && bytes > lastBytes) {
+            lastBytes = bytes; armIdle();
+            if (onProgress) onProgress(p);
+          }
+        }
+      };
+      if (state.cancel) { stop({ cancelled: true }); return; }
+      armIdle();
+      totalTimer = setTimeout(timeout, NATIVE_TOTAL_MS);
+      var callbacks = nativeCallbacks(tag);
+      try {
+        var result = bridge.upLoadToNas(task, callbacks.progress, callbacks.done, callbacks.fail, nativeNoop);
+        if (typeof result === "function") {
+          if (done) result(); else unsubscribe = result;
+        }
+        else if (result && typeof result.then === "function") result.catch(function (e) { finish(e); });
+      } catch (e) { finish(e); }
+    });
+  }
+
+  function uploadViaNative(job, ent, rel, size, mtime, offset, onProgress) {
     var bridge = getBridge();
     if (!bridge || typeof bridge.upLoadToNas !== "function") {
       return Promise.reject(new Error("桌面端缺少原生上传接口，无法传输大文件"));
     }
-    return fetchWebDavCreds().then(function (webDAV) {
-      // realdpath 必须是 WebDAV URL 格式（/pool0/data/...），而 job.destination 是
-      // 文件系统格式（/nas/pool0/u<uid>/data/...）。WebDAV nginx 规则：uri 不以
-      // /pool*/ 开头一律拒绝（实测 451/500），直接拼 destination 的 MOVE 必失败。
-      // 正确换算：/nas/pool0/<uid>/data → /pool0/data（root /home/<uid> 下 pool0 是
-      // 池软链，二者指向同一目录——已在真机用 PUT+MOVE 实证 204）。
-      // 注意：get_pool_info 的 alias_root 是 /home/u<uid>（SMB 语义），不能拿来当
-      // WebDAV URL 前缀（踩过：MOVE 到 /home/... 被 500 拒，所有文件 code=-1 连环降级）。
-      var dataRoot = (state.config && state.config.data_root) || "";
-      var destAbs = String(job.destination || "").replace(/[\\/]+$/, "") + "/" + rel;
-      var realPath;
-      if (dataRoot && destAbs.indexOf(dataRoot + "/") === 0) {
-        realPath = destAbs.slice(dataRoot.length);   // /pcbackup/work/xxx → 挂到池根
-        realPath = (webDAV.poolRoot || "/pool0/data") + realPath;
-      } else {
-        // 换算不出来（自定义 destination）：池内 pcbackup 子目录兜底
-        realPath = "/pool0/data/pcbackup" + destAbs.replace(/^\/nas\/pool[^/]+/, "");
-      }
-      var partPath = realPath + ".pcbp.part";
-      return new Promise(function (resolve, reject) {
-        var tag = forceTag || ("pcb_" + Date.now().toString(36) + "_" + Math.random().toString(36).slice(2, 8));
-        var tmp = "/pool0/data/.temp_upload_dir/" + tag + ".temptd_" + Date.now();
-        var done = false;
-        function fin(err) {
-          if (done) return;
-          done = true;
-          if (err) reject(err instanceof Error ? err : new Error(String(err)));
-          else resolve();
+    var info, nativeError;
+    function checkSource() {
+      if (state.cancel) return Promise.reject({ cancelled: true });
+      return nativeStat(bridge, ent.abs, true).then(function (st) {
+        if (st.size !== size || Math.abs(Math.floor(st.mtimeMs) - mtime) > 1) {
+          throw new Error("PC 文件已变化，请重新扫描目录");
         }
-        try {
-          bridge.upLoadToNas({
+      });
+    }
+    return checkSource().then(function () {
+      return api("POST", "api/jobs/" + job.id + "/native-upload",
+        { action: "prepare", p: rel, s: size, m: mtime, source: ent.abs });
+    }).then(function (prepared) {
+      info = prepared;
+      if (!info || !/^[0-9a-f]{32}$/.test(info.token)) throw new Error("原生上传准备响应无效，请更新插件");
+      if (info.uploaded) return;
+      return fetchWebDavCreds().then(function (webDAV) {
+        if (state.cancel) throw { cancelled: true };
+        var root = (webDAV.poolRoot || "/pool0/data").replace(/\/$/, "") + "/.temp_upload_dir/";
+        return waitNativeUpload(bridge, {
             sPath: ent.abs,
-            dPath: tmp,
-            realdpath: partPath,
-            offset: offset || 0,
+            dPath: root + info.temp_name,
+            realdpath: root + info.ready_name,
+            offset: 0,
             isNeedHead: false,
             reUse: false,
-            tag: tag,
+            tag: "pcb_" + info.token,
             webParam: JSON.stringify(webDAV),
             size: size,
             mtime: mtime || 0
-          }, function (p) {
-            if (onProgress) onProgress(p);
-          }, function () { settled(null); }, function (e) {
-            var msg = (e && e.message) || (e && e.error && e.error.message) || (e && e.code) || e;
-            var detail = e && e.error ? " [" + String(e.error).slice(0, 200) + "]" : "";
-            settled(new Error("原生上传失败：" + msg + detail));
-          }, function () {});
-        } catch (e) { fin(e); }
-
-        // 竞态垫片：桌面 App 在 PUT 与 rename 之间有 XXhash 校验（数百 ms 起），
-        // 我们跳过校验时 MOVE 紧贴 PUT，撞上 App 内置 P2P 代理隧道的转发乱序
-        // （真机实测 ~8% 的 MOVE 到达时源文件尚未落盘 → ENOENT 500）。
-        // PUT 完成后先向插件后端查一次该文件的 .part 状态再放行：
-        // 一个 RTT 的时间垫片（App 同款思路）+ 顺便对账。
-        // 查询失败不阻塞：垫片只是保险丝，不能成为新故障点。
-        function settled(err) {
-          var probe = err ? Promise.resolve() :
-            api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
-              .catch(function () { return null; });
-          probe.then(function () { fin(err); }, function () { fin(err); });
-        }
+          }, onProgress).catch(function (e) {
+            if (e.cancelled || e.transportUncertain) throw e;
+            _webDavCredCache = null;
+            nativeError = e; // A full PUT can still be reconciled after MOVE failed.
+          });
       });
+    }).then(checkSource).then(function () {
+      return api("POST", "api/jobs/" + job.id + "/native-upload",
+        { action: "complete", p: rel, token: info.token }).catch(function (e) {
+          if (e.cancelled) throw e;
+          throw new Error((nativeError ? nativeError.message + "；" : "") + e.message);
+        });
     });
   }
 
@@ -1592,7 +1678,7 @@
       state.cancel = true;
       abortAllUploads();   // 立即断掉进行中的 PUT，不等当前文件传完
       $("btnCancel").disabled = true;
-      log("正在取消…（已中断进行中的传输）", "lg-err");
+      log("正在取消传输，已完成的文件会保留…", "lg-err");
     });
     $("btnDoneBack").addEventListener("click", function () { show("view-jobs"); loadJobs(); });
     $("btnDoneAgain").addEventListener("click", function () {

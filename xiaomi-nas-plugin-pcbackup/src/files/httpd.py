@@ -11,6 +11,7 @@
 判定"是否变更"：大小 + 修改时间（毫秒），与 rsync 默认快速判定一致。
 """
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -28,6 +29,7 @@ except ImportError:
     pwd = None
 
 PORT = int(os.environ.get("PLUG_PORT", "9303"))
+PLUGIN_VERSION = "1.6.0"
 _FILES_DIR = os.path.dirname(os.path.abspath(__file__))          # <plugin>/src/files
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(_FILES_DIR))       # <plugin>/
 DATA_DIR = os.environ.get("PCBACKUP_DATA") or os.path.join(PLUGIN_ROOT, "etc")
@@ -45,6 +47,7 @@ PART_SUFFIX = ".pcbp.part"
 JSON_BODY_MAX = 128 * 1024 * 1024        # scan 请求可能携带几十万文件元数据
 CHUNK_BODY_MAX = 512 * 1024 * 1024       # 单块上限（前端默认 8MiB）
 HISTORY_KEEP = 100
+MKDIRS_BATCH_MAX = 2000
 TOMBSTONE_SOFT_LIMIT = 10                # 删除数 ≥ 此值且占比 >20% 时需要 force 确认
 TOMBSTONE_RATIO = 0.2
 ADOPT_TOLERANCE_MS = 2000                # 认领存量文件时的 mtime 容差（毫秒）
@@ -830,16 +833,135 @@ def part_size(job, rel):
 
 
 def mkdirs_for_job(job, rels):
-    """批量预建 rel 文件的父目录（直传 MOVE 前调用：WebDAV 的 rename 不会
-    自动建父目录，MOVE 到不存在的目录报 ENOENT 500——桌面 App 端同样没有
-    MKCOL 自愈，真机实测新目录首传 100% 失败）。幂等，已存在跳过。"""
+    """Validate the whole batch; never report success for silently omitted paths."""
+    if not isinstance(rels, list) or len(rels) > MKDIRS_BATCH_MAX:
+        return 400, "目录准备每批最多 %d 个文件" % MKDIRS_BATCH_MAX
+    parents = set()
+    for rel in rels:
+        path = safe_join(job["destination"], rel)
+        if path is None:
+            return 400, "目录准备包含非法路径"
+        parents.add(os.path.dirname(path))
     made = 0
-    for rel in rels[:2000]:
-        parent = os.path.dirname(safe_join(job["destination"], rel or "x"))
-        if parent and not os.path.isdir(parent):
+    for parent in sorted(parents):
+        if not os.path.isdir(parent):
             _mkdir_chowned(parent)
             made += 1
-    return 200, {"created": made}
+    return 200, {"created": made, "processed": len(rels)}
+
+
+def _native_record_path(job, rel):
+    name = hashlib.sha256(rel.encode("utf-8")).hexdigest() + ".json"
+    return safe_join(job_dir(job["id"]), "native/" + name)
+
+
+def _native_paths(record):
+    token = record.get("token")
+    stamp = record.get("prepared_ms")
+    if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or type(stamp) is not int or stamp < 0):
+        return None
+    temp_name = "pcb_%s.temptd_%d" % (token, stamp)
+    ready_name = "pcb_%s.ready" % token
+    temp = safe_join(USER_DATA_ROOT, ".temp_upload_dir/" + temp_name)
+    ready = safe_join(USER_DATA_ROOT, ".temp_upload_dir/" + ready_name)
+    if temp is None or ready is None:
+        return None
+    return {"temp_name": temp_name, "ready_name": ready_name, "temp": temp, "ready": ready}
+
+
+def _has_size(path, size):
+    return os.path.isfile(path) and os.path.getsize(path) == size
+
+
+def _committed_file_matches(job, rel, size, mtime):
+    entry = load_manifest(job)["files"].get(rel)
+    dest = safe_join(job["destination"], rel)
+    return bool(entry and size is not None and entry.get("s") == size
+                and entry.get("m") == mtime and dest and _has_size(dest, size))
+
+
+def prepare_native_upload(job, body):
+    """Keep an isolated native staging identity; the NAS owns the final rename."""
+    rel, size, mtime = body.get("p"), body.get("s"), body.get("m")
+    source = _clean_pc_path(body.get("source"))
+    if (not validate_rel(rel) or type(size) is not int or size < 0
+            or type(mtime) is not int or mtime < 0 or not source):
+        return 400, "原生上传文件信息非法"
+    dest = safe_join(job["destination"], rel)
+    part = safe_join(job["destination"], rel + PART_SUFFIX)
+    state_path = _native_record_path(job, rel)
+    if dest is None or part is None or state_path is None:
+        return 400, "原生上传路径非法"
+    identity = {"p": rel, "s": size, "m": mtime, "source": source,
+                "destination": job["destination"], "data_root": USER_DATA_ROOT}
+    with _job_lock(job["id"]):
+        record = _load_json(state_path, {})
+        if not isinstance(record, dict):
+            record = {}
+        paths = _native_paths(record)
+        same = all(record.get(k) == v for k, v in identity.items())
+        uploaded = bool(same and paths and (
+            _has_size(paths["ready"], size)
+            or (record.get("settled") and _has_size(paths["temp"], size))
+            or (record.get("finalized") and (
+                _has_size(part, size) or _committed_file_matches(job, rel, size, mtime)))))
+        if not uploaded:
+            # An unacknowledged old PUT may still be running. Give a retry its own
+            # path and token so late callbacks cannot replace the newer attempt.
+            record = dict(identity, version=1, token=uuid.uuid4().hex,
+                          prepared_ms=int(time.time() * 1000), settled=False, finalized=False)
+            paths = _native_paths(record)
+        if paths is None:
+            return 400, "原生上传临时目录非法"
+        _mkdir_chowned(os.path.dirname(dest))
+        _mkdir_chowned(os.path.dirname(paths["temp"]))
+        if os.stat(os.path.dirname(dest)).st_dev != os.stat(os.path.dirname(paths["temp"])).st_dev:
+            return 400, "原生上传目标需与用户数据目录位于同一文件系统，请使用浏览器选择文件夹"
+        _save_json(state_path, record)
+        return 200, {"token": record["token"], "temp_name": paths["temp_name"],
+                     "ready_name": paths["ready_name"], "uploaded": uploaded}
+
+
+def complete_native_upload(job, body):
+    """Reconcile a terminal native attempt, including a full PUT whose MOVE failed."""
+    rel, token = body.get("p"), body.get("token")
+    if (not validate_rel(rel) or not isinstance(token, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", token)):
+        return 400, "原生上传标识非法"
+    state_path = _native_record_path(job, rel)
+    dest = safe_join(job["destination"], rel)
+    part = safe_join(job["destination"], rel + PART_SUFFIX)
+    if state_path is None or dest is None or part is None:
+        return 400, "原生上传路径非法"
+    # Keep the same lock order as commit_file: file, then manifest/job.
+    with _upload_lock(part), _job_lock(job["id"]):
+        record = _load_json(state_path, {})
+        if (not isinstance(record, dict) or record.get("token") != token
+                or record.get("destination") != job["destination"]
+                or record.get("data_root") != USER_DATA_ROOT):
+            return 409, "原生上传记录已变化，请重试"
+        paths = _native_paths(record)
+        if paths is None:
+            return 400, "原生上传临时目录非法"
+        size = record["s"]
+        record["settled"] = True
+        _save_json(state_path, record)
+        if record.get("finalized") and (
+                _has_size(part, size) or _committed_file_matches(job, rel, size, record["m"])):
+            return 200, {"path": rel, "size": size}
+        stage = next((p for p in (paths["ready"], paths["temp"])
+                      if _has_size(p, size)), None)
+        if stage is None:
+            return 409, {"reason": "native_incomplete", "message": "原生上传数据不完整，可再次继续备份"}
+        _mkdir_chowned(os.path.dirname(dest))
+        with open(stage, "r+b") as f:
+            os.fsync(f.fileno())
+        os.replace(stage, part)
+        _try_chown(part)
+        record["finalized"] = True
+        _save_json(state_path, record)
+        return 200, {"path": rel, "size": size}
 
 
 def commit_file(job, rel, size, mtime):
@@ -850,6 +972,8 @@ def commit_file(job, rel, size, mtime):
     part = destf + PART_SUFFIX
     with _upload_lock(part):
         if not os.path.isfile(part):
+            if _committed_file_matches(job, rel, size, mtime):
+                return 200, {"path": rel, "size": size}
             return 400, "分块数据不存在，请重新上传该文件"
         actual = os.path.getsize(part)
         if size is not None and actual != size:
@@ -1137,7 +1261,7 @@ def job_summary(job):
 # ── HTTP ────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "pcbackup/1.0"
+    server_version = "pcbackup/" + PLUGIN_VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -1218,11 +1342,11 @@ class Handler(BaseHTTPRequestHandler):
             parts = [unquote(p) for p in path.split("/") if p]
 
             if path == "/api/health":
-                self._ok({"status": "running", "version": "1.2.0", "plugin": "pcbackup"})
+                self._ok({"status": "running", "version": PLUGIN_VERSION, "plugin": "pcbackup"})
 
             elif path == "/api/config":
                 self._ok({"data_root": USER_DATA_ROOT, "del_suffix": DEL_SUFFIX,
-                          "version": "1.2.0"})
+                          "version": PLUGIN_VERSION})
 
             elif path == "/api/jobs":
                 self._ok([job_summary(j) for j in load_jobs().values()])
@@ -1336,6 +1460,19 @@ class Handler(BaseHTTPRequestHandler):
                     body = self._read_json()
                     code, data = mkdirs_for_job(job, body.get("paths", []))
                     (self._ok if code == 200 else lambda d: self._err(code, data))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "native-upload":
+                job = self._job(parts[2]) or None
+                if job:
+                    body = self._read_json()
+                    action = body.get("action")
+                    if action == "prepare":
+                        code, data = prepare_native_upload(job, body)
+                    elif action == "complete":
+                        code, data = complete_native_upload(job, body)
+                    else:
+                        code, data = 400, "原生上传操作非法"
+                    (self._ok if code == 200 else lambda d: self._err(code, d))(data)
 
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "commit":
                 job = self._job(parts[2]) or None
