@@ -7,6 +7,13 @@ const vm = require('node:vm');
 const source = fs.readFileSync(path.join(__dirname, '../xiaomi-nas-plugin-pcbackup/src/ui/app.js'), 'utf8');
 const boot = source.lastIndexOf('  bind();');
 const flush = async () => { for (let i = 0; i < 30; i++) await Promise.resolve(); };
+async function until(predicate) {
+  for (let i = 0; i < 100; i++) {
+    await flush();
+    if (predicate()) return;
+  }
+  assert.fail('asynchronous upload runner did not reach the expected state');
+}
 
 function harness(options = {}) {
   let now = 0, next = 1, tokenId = 1;
@@ -46,7 +53,10 @@ function harness(options = {}) {
   const response = data => ({ ok: true, status: 200, json: async () => data });
   function fetch(url, opt = {}) {
     requests.push({ url, opt });
-    if (options.fetch) return options.fetch(url, opt, response);
+    if (options.fetch) {
+      const custom = options.fetch(url, opt, response);
+      if (custom !== undefined) return custom;
+    }
     if (url.includes('get_pool_info')) return Promise.resolve(response({ data: { webDAV: { poolRoot: '/pool0/data' } } }));
     const body = opt.body && JSON.parse(opt.body);
     let data = {};
@@ -92,6 +102,103 @@ test('directory preparation covers 4001 files in acknowledged batches', async ()
   assert.equal(batches.flat().length, 4001);
   assert.ok(batches.every(b => b.length <= 2000));
   assert.equal(batches.flat().at(-1), 'folder-4000/a.txt');
+});
+
+test('two directory batches overlap and out-of-order acknowledgements advance progress monotonically', async () => {
+  const pending = [], updates = [];
+  let active = 0, maxActive = 0;
+  const h = harness({ fetch: (url, opt, response) => new Promise(resolve => {
+    const size = JSON.parse(opt.body).paths.length;
+    active++; maxActive = Math.max(maxActive, active);
+    pending.push(() => { active--; resolve(response({ code: 0, data: { processed: size, created: 1 } })); });
+  }) });
+  const paths = Array.from({ length: 4001 }, (_, i) => [`folder-${i}/a.txt`, 5]);
+  const p = h.prepareNativeDirectories(job, paths, (n, total, info) => updates.push({ n, total, ...info }));
+  await flush();
+  assert.equal(pending.length, 2);
+  pending[1](); await flush();
+  assert.equal(pending.length, 3);
+  pending[2](); await flush();
+  assert.deepEqual(updates.map(u => u.n), [2000, 2001]);
+  pending[0]();
+  const result = await p;
+  assert.equal(maxActive, 2);
+  assert.deepEqual(updates.map(u => u.n), [2000, 2001, 4001]);
+  assert.deepEqual(updates.map(u => u.batch), [2, 3, 1]);
+  assert.deepEqual(updates.map(u => u.completed), [1, 2, 3]);
+  assert.ok(updates.every(u => u.total === 4001 && u.batches === 3));
+  assert.equal(result.created, 3);
+  assert.equal(h.timers.size, 0);
+});
+
+test('directory failure stops new batches and drains the other request before settling', async () => {
+  const pending = [];
+  const h = harness({ fetch: (url, opt, response) => new Promise(resolve => {
+    const size = JSON.parse(opt.body).paths.length;
+    pending.push(processed => resolve(response({ code: 0, data: { processed, created: 1 } })));
+  }) });
+  const paths = Array.from({ length: 6001 }, (_, i) => [`folder-${i}/a.txt`, 5]);
+  let settled = false;
+  const result = h.prepareNativeDirectories(job, paths).then(() => { settled = true; }, e => { settled = true; return e; });
+  await flush();
+  assert.equal(pending.length, 2);
+  pending[0](0); await flush();
+  assert.equal(settled, false);
+  assert.equal(pending.length, 2);
+  pending[1](2000);
+  assert.match((await result).message, /未覆盖全部文件/);
+  assert.equal(pending.length, 2);
+  assert.equal(h.timers.size, 0);
+});
+
+test('black log shows preparation batches and upload phase only after all batches succeed', async () => {
+  const pending = [];
+  const h = harness({ fetch: (url, opt, response) => {
+    if (url.endsWith('/mkdirs')) return new Promise(resolve => {
+      const size = JSON.parse(opt.body).paths.length;
+      pending.push(() => resolve(response({ code: 0, data: { processed: size, created: 0 } })));
+    });
+  } });
+  const upload = Array.from({ length: 2001 }, (_, i) => [`new-${i}/a.txt`, 5]);
+  Object.assign(h.state, { job: { ...job, name: 'documents' }, plan: { upload, upload_bytes: 10005, deleted: [] },
+    sourcePath: 'D:\\docs', fileMap: Object.fromEntries(upload.map(([p]) => [p, entry])) });
+  const logs = () => h.nodes.get('runLog').childNodes.map(n => n.textContent).join('\n');
+  h.runUploadActive(); await flush();
+  assert.equal(pending.length, 2);
+  assert.match(logs(), /documents/);
+  assert.match(logs(), /\[阶段\] 准备目录/);
+  assert.match(logs(), /2 批并发/);
+  pending[1](); await flush();
+  assert.equal(h.native.length, 0);
+  assert.match(logs(), /已完成 1 \/ 2 批.*累计处理 1 \/ 2001 个文件路径/);
+  assert.doesNotMatch(logs(), /\[阶段\] 上传中/);
+  pending[0](); await flush(); await flush();
+  assert.match(logs(), /已完成 2 \/ 2 批.*累计处理 2001 \/ 2001 个文件路径/);
+  assert.match(logs(), /\[阶段\] 上传中/);
+  h.state.cancel = true; h.abortAllUploads();
+  await until(() => !h.state.running); await flush();
+  assert.match(logs(), /\[阶段\] 已取消/);
+  assert.equal(h.timers.size, 0);
+});
+
+test('upload runner fills six slots and refills only after a file finishes', async () => {
+  const h = harness();
+  const upload = Array.from({ length: 8 }, (_, i) => [`file-${i}.txt`, 5]);
+  Object.assign(h.state, { job, plan: { upload, upload_bytes: 40, deleted: [], skipped: 0 }, sourcePath: 'D:\\docs',
+    fileMap: Object.fromEntries(upload.map(([p]) => [p, { ...entry, abs: 'D:\\docs\\' + p }])) });
+  h.runUploadActive();
+  for (let i = 0; i < 10 && h.native.length === 0; i++) await flush();
+  assert.equal(h.native.length, 6);
+  h.native[0].done({ size: 5, mtimeMs: 1000 }); await until(() => h.native.length === 7);
+  assert.equal(h.native.length, 7);
+  h.native[1].done({ size: 5, mtimeMs: 1000 }); await until(() => h.native.length === 8);
+  assert.equal(h.native.length, 8);
+  for (const task of h.native.slice(2)) task.done({ size: 5, mtimeMs: 1000 });
+  await until(() => !h.state.running); await flush();
+  assert.equal(h.state.running, false);
+  const finish = h.requests.find(r => r.url.endsWith('/finish'));
+  assert.equal(JSON.parse(finish.opt.body).uploaded, 8);
+  assert.equal(h.timers.size, 0);
 });
 
 test('unacknowledged directory coverage blocks the actual upload runner', async () => {
@@ -255,7 +362,7 @@ test('the actual upload runner completes 2001 native files after all directory b
   await flush();
   assert.equal(h.state.running, false);
   assert.equal(h.native.length, 2001);
-  assert.ok(maxActive <= 3);
+  assert.ok(maxActive <= 6);
   const requests = h.requests.filter(r => r.opt.body).map(r => ({ url: r.url, ...JSON.parse(r.opt.body) }));
   assert.deepEqual(requests.filter(r => r.url.endsWith('/mkdirs')).map(r => r.paths.length), [2000, 1]);
   assert.equal(requests.filter(r => r.action === 'complete').length, 2001);
@@ -272,14 +379,19 @@ test('cancelling directory preparation records cancellation and preserves the ch
     if (url.endsWith('/mkdirs')) return new Promise(() => {});
     return response({ code: 0, data: url.endsWith('/jobs') ? [] : { status: 'cancelled' } });
   } });
-  Object.assign(h.state, { job, plan: { upload: [['a.txt', 5]], upload_bytes: 5, deleted: [] },
+  const upload = Array.from({ length: 5001 }, (_, i) => [`new-${i}/a.txt`, 5]);
+  Object.assign(h.state, { job, plan: { upload, upload_bytes: 25005, deleted: [] },
     resumeRunId: 'saved-run', sourcePath: 'D:\\docs', fileMap: { 'a.txt': entry } });
-  h.runUploadActive(); await flush(); h.state.cancel = true; h.abortAllUploads(); await flush();
+  h.runUploadActive(); await flush();
+  assert.equal(h.requests.filter(r => r.url.endsWith('/mkdirs')).length, 2);
+  h.state.cancel = true; h.abortAllUploads(); await flush();
   assert.equal(h.state.running, false);
   const finish = h.requests.find(r => r.url.endsWith('/finish'));
   assert.ok(finish, 'cancelled preparation must settle the saved run too');
   assert.equal(JSON.parse(finish.opt.body).cancelled, true);
   assert.equal(JSON.parse(finish.opt.body).run_id, 'saved-run');
   assert.equal(h.native.length, 0);
+  assert.equal(h.requests.filter(r => r.url.endsWith('/mkdirs')).length, 2);
+  assert.ok(h.requests.filter(r => r.url.endsWith('/mkdirs')).every(r => r.opt.signal.aborted));
   assert.equal(h.timers.size, 0);
 });

@@ -29,7 +29,7 @@ except ImportError:
     pwd = None
 
 PORT = int(os.environ.get("PLUG_PORT", "9303"))
-PLUGIN_VERSION = "1.6.0"
+PLUGIN_VERSION = "1.6.1"
 _FILES_DIR = os.path.dirname(os.path.abspath(__file__))          # <plugin>/src/files
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(_FILES_DIR))       # <plugin>/
 DATA_DIR = os.environ.get("PCBACKUP_DATA") or os.path.join(PLUGIN_ROOT, "etc")
@@ -844,8 +844,7 @@ def mkdirs_for_job(job, rels):
         parents.add(os.path.dirname(path))
     made = 0
     for parent in sorted(parents):
-        if not os.path.isdir(parent):
-            _mkdir_chowned(parent)
+        if _mkdir_chowned(parent):
             made += 1
     return 200, {"created": made, "processed": len(rels)}
 
@@ -1116,17 +1115,30 @@ def _resolve_dest(body):
 
 
 def _mkdir_chowned(dest):
-    """创建目录（含父级），并把新建的目录归还给插件用户。"""
+    """创建并归还目录；仅本调用实际创建目标目录时返回 True。"""
     if os.path.isdir(dest):
-        return
+        return False
     missing = []
     p = dest
     while not os.path.exists(p) and p not in ("/",):
         missing.append(p)
         p = os.path.dirname(p)
-    os.makedirs(dest, exist_ok=True)
-    for d in missing:
-        _try_chown(d)
+    if not missing:
+        if not os.path.isdir(dest):
+            raise NotADirectoryError(dest)
+        return False
+    created = False
+    for d in reversed(missing):
+        try:
+            os.mkdir(d)
+        except FileExistsError:
+            if not os.path.isdir(d):
+                raise
+        else:
+            _try_chown(d)
+            if d == dest:
+                created = True
+    return created
 
 
 # ── 任务管理 ────────────────────────────────────────────────

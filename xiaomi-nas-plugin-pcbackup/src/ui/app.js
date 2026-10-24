@@ -15,6 +15,8 @@
   var NATIVE_IDLE_MS = 120000;
   var NATIVE_TOTAL_MS = 6 * 60 * 60 * 1000;
   var MKDIRS_BATCH_MAX = 2000;
+  var MKDIRS_CONCURRENCY = 2;
+  var UPLOAD_CONCURRENCY = 6;
   var DEFAULT_EXCLUDES = [
     "Thumbs.db", "desktop.ini", ".DS_Store", "~$*",
     "node_modules/", ".pnpm-store/", ".venv/", "venv/", ".gradle/",
@@ -712,22 +714,40 @@
   }
 
   function prepareNativeDirectories(job, uploads, progress) {
-    var index = 0, made = 0;
-    function batch() {
-      if (state.cancel) return Promise.reject({ cancelled: true });
-      if (index >= uploads.length) return Promise.resolve({ created: made });
-      var paths = uploads.slice(index, index + MKDIRS_BATCH_MAX).map(function (item) { return item[0]; });
+    var index = 0, processed = 0, made = 0, completed = 0, failure = null;
+    var batches = Math.ceil(uploads.length / MKDIRS_BATCH_MAX);
+    function worker() {
+      if (state.cancel) failure = failure || { cancelled: true };
+      if (failure || index >= uploads.length) return Promise.resolve();
+      var start = index;
+      var paths = uploads.slice(start, start + MKDIRS_BATCH_MAX).map(function (item) { return item[0]; });
+      index += paths.length;
+      var batch = Math.floor(start / MKDIRS_BATCH_MAX) + 1;
       return api("POST", "api/jobs/" + job.id + "/mkdirs", { paths: paths }).then(function (result) {
+        if (state.cancel) throw { cancelled: true };
         if (!result || result.processed !== paths.length) {
           throw new Error("目录准备未覆盖全部文件，请更新插件后重试");
         }
         made += result.created || 0;
-        index += paths.length;
-        if (progress) progress(index, uploads.length);
-        return batch();
-      });
+        processed += paths.length;
+        completed++;
+        if (progress) progress(processed, uploads.length, { batch: batch, completed: completed, batches: batches });
+      }).catch(function (e) {
+        failure = failure || e || new Error("目录准备失败");
+        if (!(e && e.cancelled)) {
+          log("[准备目录] 批次 " + batch + " / " + batches + " 失败：" + (e.message || e) +
+            "；停止派发新批次，等待已发出的请求结束", "lg-err");
+        }
+      }).then(worker);
     }
-    return batch();
+    var workers = [];
+    for (var w = 0; w < MKDIRS_CONCURRENCY; w++) workers.push(worker());
+    // Drain every in-flight batch before reporting failure or starting uploads.
+    return Promise.all(workers).then(function () {
+      if (state.cancel) throw { cancelled: true };
+      if (failure) throw failure;
+      return { created: made };
+    });
   }
 
   function runUpload() {
@@ -780,6 +800,7 @@
     $("stepRun").scrollIntoView({ behavior: "smooth", block: "nearest" });
     logBox = $("runLog");
     logBox.innerHTML = "";
+    log("[任务] " + (job.name || job.id), "lg-skip");
 
     var t0 = Date.now();
     var doneBytes = plan.previous_bytes || 0;
@@ -805,6 +826,7 @@
       var changed = phase !== pendingPhase;
       pendingPhase = phase;
       if (curFile !== undefined) pendingFile = curFile;
+      if (changed) log("[阶段] " + phase, phase === "异常中断" ? "lg-err" : "lg-skip");
       if (force || changed || Date.now() - lastPaint >= 200) paintProgress();
       else if (paintTimer === null) paintTimer = setTimeout(paintProgress, 200);
     }
@@ -941,16 +963,24 @@
     if (state.sourcePath && !getPcFs() && plan.upload.length) {
       chain = chain.then(function () {
         setProgress("准备目录…", "");
-        return prepareNativeDirectories(job, plan.upload, function (n, total) {
-          setProgress("准备目录…", n + " / " + total);
+        var batches = Math.ceil(plan.upload.length / MKDIRS_BATCH_MAX);
+        log("[准备目录] 共 " + batches + " 批，" + MKDIRS_CONCURRENCY + " 批并发；每批最多 " +
+          MKDIRS_BATCH_MAX + " 个文件路径", "lg-skip");
+        return prepareNativeDirectories(job, plan.upload, function (n, total, info) {
+          var text = "已完成 " + info.completed + " / " + info.batches + " 批；累计处理 " +
+            n + " / " + total + " 个文件路径";
+          setProgress("准备目录…", text);
+          log("[准备目录] 批次 " + info.batch + " / " + info.batches + " 完成；" + text, "lg-skip");
         })
           .then(function (r) {
-            if (r && r.created) log("已预建 " + r.created + " 个目录", "lg-skip");
+            log("[准备目录] 全部完成，新增 " + r.created + " 个目标父目录", "lg-ok");
           });
       });
     }
     chain = chain.then(function () {
-      var CONCURRENCY = 3;
+      if (plan.upload.length) {
+        log("[上传] 待传 " + plan.upload.length + " 个文件，" + UPLOAD_CONCURRENCY + " 文件并发", "lg-skip");
+      }
       var queue = plan.upload.slice();
       function worker() {
         if (state.cancel || !queue.length) return Promise.resolve();
@@ -964,8 +994,8 @@
       }
       var workers = [];
       // 不要用 queue.length 当循环条件：worker() 同步 shift 会让队列中途变短，
-      // 小批量（≤4 个文件）只能起 1~2 个 worker，退化成串行
-      for (var w = 0; w < CONCURRENCY; w++) workers.push(worker());
+      // 固定启动槽位，避免小队列少启动 worker。
+      for (var w = 0; w < UPLOAD_CONCURRENCY; w++) workers.push(worker());
       return Promise.all(workers);
     });
 
@@ -990,6 +1020,8 @@
       renderDone(okCount, delCount, failed, plan, state.cancel, Date.now() - t0);
       loadJobs();
     }).catch(function (e) {
+      setProgress("异常中断", "", true);
+      log("[异常] " + (e && e.message || e), "lg-err");
       clearTimeout(paintTimer);
       $("btnCancel").disabled = true;
       state.running = false;

@@ -5,6 +5,8 @@ from pathlib import Path
 import tempfile
 import threading
 import unittest
+from concurrent.futures import ThreadPoolExecutor
+from unittest.mock import patch
 from urllib.error import HTTPError
 from urllib.request import Request, urlopen
 
@@ -59,6 +61,27 @@ class TransferTests(unittest.TestCase):
         code, _ = backend.mkdirs_for_job(self.job, ["new/file%d" % n for n in range(2001)])
         self.assertEqual(code, 400)
         self.assertFalse((Path(self.job["destination"]) / "new").exists())
+
+    def test_concurrent_directory_batches_do_not_double_count_a_shared_parent(self):
+        target = str(Path(self.job["destination"]) / "shared/sub")
+        barrier = threading.Barrier(2)
+        observed = set()
+        original = os.path.isdir
+
+        def initial_missing(path):
+            ident = threading.get_ident()
+            if os.fspath(path) == target and ident not in observed:
+                observed.add(ident)
+                barrier.wait(timeout=3)
+                return False
+            return original(path)
+
+        with patch.object(backend.os.path, "isdir", side_effect=initial_missing):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                results = list(pool.map(lambda _: backend.mkdirs_for_job(self.job, ["shared/sub/a.txt"]), range(2)))
+        self.assertTrue(Path(target).is_dir())
+        self.assertTrue(all(code == 200 and result["processed"] == 1 for code, result in results))
+        self.assertEqual(sum(result["created"] for _, result in results), 1)
 
     def test_invalid_directory_path_does_not_create_earlier_directories(self):
         for invalid in ["../escape", "/absolute", "a\\b", None, 123]:
