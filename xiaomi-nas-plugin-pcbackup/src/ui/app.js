@@ -38,6 +38,7 @@
     resumeRunId: null,
     resumeInfo: null,
     isResuming: false,
+    browserResumeRequested: false,
     discardResumeOnRun: false,
     resumeNoticeShown: false,
     cancel: false,
@@ -111,6 +112,11 @@
             throw err;
           }
           return j;
+        }, function (e) {
+          // HTML gateway errors still carry an HTTP failure, rather than
+          // masquerading as a network loss that healthy admissions can reset.
+          if (!r.ok) e.status = r.status;
+          throw e;
         });
       }).then(function (j) { finish(resolve, j); }, function (e) { finish(reject, e); });
     });
@@ -122,7 +128,7 @@
       opt.headers = { "Content-Type": "application/json" };
       opt.body = JSON.stringify(body);
     }
-    var cancellable = state.running && /\/(part|commit|mkdirs|native-upload|deleted)(?:\?|$)/.test(ep);
+    var cancellable = state.running && /\/(part|commit|mkdirs|prepare-paths|native-upload|deleted)(?:\?|$)/.test(ep);
     return requestJson(apiUrl(ep), opt, cancellable).then(function (j) {
         if (j.code !== undefined && j.code !== 0) {
           var err = new Error(j.message || ("服务端错误 " + j.code));
@@ -131,6 +137,94 @@
         }
         return j.data;
     });
+  }
+
+  function operationId() {
+    var id = "";
+    for (var n = 0; n < 32; n++) id += Math.floor(Math.random() * 16).toString(16);
+    return id;
+  }
+
+  function waitSecond() {
+    return new Promise(function (resolve) { setTimeout(resolve, 1000); });
+  }
+
+  function finishAndWait(job, stats) {
+    // Retries keep exactly the same identity and stats, including elapsed time.
+    stats.async = true;
+    stats.request_id = operationId();
+    var base = "api/jobs/" + job.id, failures = 0, networkFailures = 0, cancelSent = false;
+    function request(submit) {
+      var promise, cancelling = state.cancel && !stats.cancelled && !cancelSent && !submit;
+      if (cancelling) {
+        promise = api("POST", base + "/finish-cancel", { request_id: stats.request_id })
+          .then(function (out) { cancelSent = true; return out; });
+      } else {
+        promise = submit ? api("POST", base + "/finish", stats)
+          : api("GET", base + "/finish-status?request_id=" + stats.request_id);
+      }
+      return promise.then(function (out) {
+        if (out && out.phase === "done") return out.result;
+        if (out && out.phase === "running") {
+          networkFailures = 0;
+          // An admission ACK cannot prove a failed verifier has recovered.
+          if (!submit && !cancelling) failures = 0;
+          return waitSecond().then(function () { return request(false); });
+        }
+        // Compatibility with a synchronous server's explicit final receipt.
+        if (out && out.status) return out;
+        throw new Error("收尾响应无效，请刷新后检查备份结果");
+      }, function (e) {
+        if (e.status && e.status < 500 && e.status !== 404) throw e;
+        if ((e.status ? ++failures : ++networkFailures) >= RETRY_MAX) throw e;
+        log("[收尾] 连接或确认失败，正在查询或重试：" + e.message, "lg-err");
+        return waitSecond().then(function () { return request(submit || !!e.status); });
+      });
+    }
+    return request(true);
+  }
+
+  function readResume(job) {
+    var id = job.resume_check_pending || operationId(), failures = 0, networkFailures = 0;
+    var finishId = job.finish_pending, finishResult = null, retryFinish = false, admission = true;
+    function poll() {
+      if (state.job !== job) return Promise.resolve(null);
+      var ep = "api/jobs/" + job.id + (finishId ? "/finish-status?request_id=" + finishId
+        : "/resume?async=1&request_id=" + id);
+      var admitting = admission || retryFinish;
+      var request = finishId && retryFinish
+        ? api("POST", "api/jobs/" + job.id + "/finish-retry", { request_id: finishId })
+        : api("GET", ep);
+      return request.then(function (out) {
+        retryFinish = false;
+        networkFailures = 0;
+        if (!admitting) failures = 0;
+        admission = false;
+        if (finishId) {
+          if (out.phase === "running") return waitSecond().then(poll);
+          finishId = null;
+          finishResult = out.result;
+          if (!finishResult || ["ok", "partial", "cancelled"].indexOf(finishResult.status) < 0) {
+            throw new Error("服务端尚未确认上次备份结果");
+          }
+          if (finishResult.status === "ok") return { finish_result: finishResult };
+          failures = 0; // A subsequent resume check is a separate operation.
+          admission = true;
+          return poll();
+        }
+        id = out.request_id;
+        if (out.phase === "done") return out.result || (finishResult ? { finish_result: finishResult } : null);
+        if (out.phase !== "running") throw new Error("续传校验响应无效");
+        return waitSecond().then(poll);
+      }, function (e) {
+        if (e.status && e.status < 500) throw e;
+        if ((e.status ? ++failures : ++networkFailures) >= RETRY_MAX) throw e;
+        retryFinish = !!finishId && !!e.status;
+        admission = !!e.status;
+        return waitSecond().then(poll);
+      });
+    }
+    return poll();
   }
 
   function toast(msg, isErr) {
@@ -224,15 +318,17 @@
           '<p class="meta muted ellipsis" title="' + esc(j.destination) + '">📁 ' + esc(destLabel(j)) + "</p>" +
           '<div class="job-stats">' +
             (j.resume_available ? '<span class="pill warn">上次备份未完成</span>' : '') +
-            '<span class="pill ok">' + j.files + " 个文件</span>" +
-            '<span class="pill">' + fmtBytes(j.bytes) + "</span>" +
+            (j.summary_pending || j.finish_pending ? '<span class="pill warn">' +
+              (j.finish_pending ? '收尾校验中…' : (j.resume_check_pending ? '续传核对中…' : '统计读取中…')) + '</span>' :
+              '<span class="pill ok">' + j.files + ' 个文件</span><span class="pill">' + fmtBytes(j.bytes) + '</span>') +
             '<span class="pill warn">上次：' + (j.last_run ? fmtTime(j.last_run) : "从未") + "</span>" +
           "</div>" +
           '<p class="meta muted">上次结果：上传 ' + (last.uploaded || 0) + " · 跳过 " + (last.skipped || 0) +
             " · 标记删除 " + (last.deleted || 0) + "</p>" +
           '<div class="job-actions">' +
             '<button class="btn primary" data-act="backup" data-id="' + j.id + '">' +
-              (j.resume_available ? '继续备份' : '开始备份') + '</button>' +
+              (j.finish_pending ? '查看收尾进度' : (j.resume_check_pending ? '查看续传进度' :
+                (j.resume_available ? '继续备份' : '开始备份'))) + '</button>' +
             '<button class="btn" data-act="files" data-id="' + j.id + '">文件</button>' +
             '<button class="btn" data-act="history" data-id="' + j.id + '">历史</button>' +
             '<button class="btn" data-act="edit" data-id="' + j.id + '">编辑</button>' +
@@ -318,10 +414,14 @@
   /* ── 备份流程 ──────────────────────────── */
 
   function openBackup(job) {
+    state.scanToken = (state.scanToken || 0) + 1;
+    state.pickToken = (state.pickToken || 0) + 1;
+    var token = state.pickToken;
     state.job = job;
     state.entries = null; state.plan = null; state.folder = "";
     state.sourcePath = ""; state.resumeRunId = null;
     state.resumeInfo = null; state.isResuming = false;
+    state.browserResumeRequested = false;
     state.discardResumeOnRun = false;
     $("bkJobName").textContent = job.name;
     $("bkJobDest").textContent = "📁 " + destLabel(job);
@@ -341,25 +441,41 @@
     if (job.resume_available) {
       $("stepPick").hidden = true;
       $("stepResume").hidden = false;
-      $("resumeSummary").textContent = "正在读取上次备份进度…";
-      api("GET", "api/jobs/" + job.id + "/resume").then(function (info) {
-        if (state.job !== job) return;
+      $("btnResumeFresh").disabled = !!job.finish_pending;
+      $("btnResume").disabled = true;
+      $("resumeSummary").textContent = job.finish_pending ? "收尾校验中，请等待服务端确认结果…" : "正在读取上次备份进度…";
+      readResume(job).then(function (info) {
+        if (state.job !== job || state.pickToken !== token) return;
+        $("btnResumeFresh").disabled = false;
+        if (info && info.finish_result) {
+          $("resumeSummary").textContent = info.finish_result.status === "ok"
+            ? "上次备份已完成，服务端已确认成功。可在历史记录中查看结果。"
+            : "上次备份" + (info.finish_result.status === "cancelled" ? "已取消" : "部分失败") + "，请重新选择源目录后继续。";
+          loadJobs();
+          return;
+        }
         if (!info || !info.run_id) { $("stepResume").hidden = true; $("stepPick").hidden = false; return; }
         state.resumeInfo = info;
         $("resumeSummary").textContent = "已完成 " + info.plan.previous_uploaded +
           " 个文件，待上传 " + info.files.length + " 个，待处理删除 " +
           info.plan.deleted.length + " 个；可从 NAS 上的未完成分块继续。";
         $("resumePath").textContent = "PC 目录：" + info.source_path;
-        $("btnResume").disabled = !getBridge();
+        var browser = info.source_kind === "browser";
+        $("btnResume").disabled = !browser && !getBridge();
+        $("btnResume").textContent = browser ? "选择原目录继续" : "继续备份";
+        if (browser) $("resumePath").textContent = "请重新选择原来的「" + info.plan.folder + "」目录";
         var warning = (info.del_mode === "delete" && info.plan.deleted.length)
           ? "上次选择了直接删除 PC 上已删除的文件。" : "";
         if (info.prune_excluded) warning += "上次选择了清理排除文件。";
-        $("resumeHint").textContent = getBridge()
+        $("resumeHint").textContent = browser
+          ? warning + "重新选择原目录并核对待传文件后，从已保存的分块继续。"
+          : getBridge()
           ? warning + "继续时只处理上次计划；期间新增或删除的文件需下次重新扫描。"
           : "请在小米桌面 App 中打开插件，才能按保存的 PC 路径继续。";
       }).catch(function (e) {
-        if (state.job !== job) return;
-        state.discardResumeOnRun = true;
+        if (state.job !== job || state.pickToken !== token) return;
+        state.discardResumeOnRun = e.status === 409;
+        $("btnResumeFresh").disabled = false;
         $("stepResume").hidden = true; $("stepPick").hidden = false;
         toast("读取续传记录失败：" + e.message, true);
       });
@@ -368,7 +484,17 @@
 
   function resumeBackup() {
     var info = state.resumeInfo;
-    if (!info || !getBridge() || state.running) return;
+    if (!info || state.running) return;
+    if (info.source_kind === "browser") {
+      state.sourcePath = "";
+      if (!info.files.length) { state.fileMap = {}; applyResumePlan(info); return; }
+      state.browserResumeRequested = true;
+      $("stepResume").hidden = true;
+      $("stepPick").hidden = false;
+      $("dirInput").click();
+      return;
+    }
+    if (!getBridge()) return;
     state.sourcePath = info.source_path;
     state.resumeRunId = info.run_id;
     state.isResuming = true;
@@ -381,6 +507,12 @@
         size: item[1], mtime: item[2]
       };
     });
+    applyResumePlan(info);
+  }
+
+  function applyResumePlan(info) {
+    state.resumeRunId = info.run_id;
+    state.isResuming = true;
     state.plan = info.plan;
     $("stepResume").hidden = true;
     renderPlan(info.plan);
@@ -412,16 +544,63 @@
 
   // -- 选择目录 --
 
+  function beginPick() {
+    if (state.running) { toast("正在传输，先取消再重新选目录", true); return null; }
+    if (state.resumeRunId && state.resumeInfo && state.resumeInfo.source_kind === "browser" && !state.discardResumeOnRun) {
+      state.browserResumeRequested = true;
+    }
+    state.pickToken = (state.pickToken || 0) + 1;
+    state.scanToken = (state.scanToken || 0) + 1;
+    state.plan = null;
+    state.resumeRunId = null;
+    state.isResuming = false;
+    $("stepPlan").hidden = true;
+    return { job: state.job, token: state.pickToken };
+  }
+
+  function currentPick(pick) {
+    return pick && state.job === pick.job && state.pickToken === pick.token && !state.running;
+  }
+
+  function resumeBrowserSelection(pick) {
+    var info = state.resumeInfo;
+    if (info.needsRefresh) {
+      setPickStatus("正在核对上次备份进度…");
+      return readResume(pick.job).then(function (fresh) {
+        if (!currentPick(pick)) return;
+        if (!fresh || !fresh.run_id) throw new Error("原备份计划已结束，请重新扫描");
+        state.resumeInfo = fresh;
+        resumeBrowserSelection(pick);
+      }).catch(function (e) { if (currentPick(pick)) { setPickStatus(null); toast(e.message, true); } });
+    }
+    var matches = info.plan.folder === state.folder && info.files.every(function (item) {
+      var entry = state.fileMap[item[0]];
+      return entry && entry.size === item[1] && Math.abs(entry.mtime - item[2]) <= 1;
+    });
+    if (matches) {
+      state.browserResumeRequested = false;
+      applyResumePlan(info);
+      return;
+    }
+    ask("目录或文件已变化", "所选目录与上次未完成计划不一致，是否重新扫描？旧备份和未完成分块会保留。").then(function (yes) {
+      if (!currentPick(pick)) return;
+      if (yes) {
+        state.resumeInfo = null;
+        state.browserResumeRequested = false;
+        state.discardResumeOnRun = true;
+        doScan(false, false);
+      } else {
+        $("stepResume").hidden = false;
+        $("stepPick").hidden = true;
+      }
+    });
+  }
+
   // 大目录逐文件过滤必须分块让出主线程，否则 UI 冻死
   // 选择结果收口（经典 FileList 与原生读取共用）
   // 条目统一形状：{rel, file?|abs?, size, mtime}
-  function finishPick(entries, folderName, sourceLabel, excludedCount) {
-    if (state.running) { toast("正在传输中，等完成或取消后再重新选择", true); return; }
-    if (!entries.length) {
-      setPickStatus(null);
-      toast("该目录下没有可备份的文件（可能全被排除规则过滤了）", true);
-      return;
-    }
+  function finishPick(entries, folderName, sourceLabel, excludedCount, pick) {
+    if (!currentPick(pick)) return;
     entries.sort(function (a, b) { return a.rel < b.rel ? -1 : 1; });
     state.entries = entries;
     state.folder = folderName || "目录";
@@ -436,10 +615,16 @@
     $("pickInfo").hidden = false;
     $("pickCount").textContent = entries.length + " 个文件";
     resetSteps();
+    if (state.browserResumeRequested && state.resumeInfo) {
+      resumeBrowserSelection(pick);
+      return;
+    }
     doScan(false, false);
   }
 
-  function onPicked(files, folderName) {
+  function onPicked(files, folderName, pick) {
+    pick = pick || beginPick();
+    if (!currentPick(pick)) return;
     state.sourcePath = "";
     var job = state.job;
     var n = files.length;
@@ -449,6 +634,7 @@
     var CHUNK = 3000;
 
     function step() {
+      if (!currentPick(pick)) return;
       var end = Math.min(idx + CHUNK, n);
       for (; idx < end; idx++) {
         var f = files[idx];
@@ -465,7 +651,7 @@
         setTimeout(step, 0);
         return;
       }
-      finishPick(entries, folderName, "", n - entries.length);
+      finishPick(entries, folderName, "", n - entries.length, pick);
     }
 
     setPickStatus("正在筛选文件…");
@@ -510,22 +696,33 @@
   // -- 增量比对 --
 
   function doScan(confirm, force) {
+    if (state.running) return;
     var job = state.job;
     var meta = state.entries.map(function (e) {
       return { p: e.rel, s: e.size, m: e.mtime };
     });
     $("stepPlan").hidden = true;
     state.scanToken = (state.scanToken || 0) + 1;
+    var token = state.scanToken;
+    function current() { return state.job === job && state.scanToken === token && !state.running; }
     setPickStatus("正在发送文件清单（" + meta.length + " 个文件）…");
     api("POST", "api/jobs/" + job.id + "/scan",
         { folder: state.folder, files: meta, confirm: !!confirm, force: !!force,
           replace_resume: state.discardResumeOnRun })
-      .then(function () { pollScan(job.id, state.scanToken); })
+      .then(function () { if (current()) pollScan(job.id, token); })
       .catch(function (e) {
+        if (!current()) return;
         setPickStatus(null);
         if (e.data && e.data.reason === "folder_mismatch") {
           ask("切换备份目录？", e.data.message).then(function (yes) {
-            if (yes) doScan(true, force);
+            if (yes && current()) doScan(true, force);
+          });
+        } else if (e.data && e.data.reason === "resume_corrupt") {
+          ask("重新扫描备份目录？", e.data.message || e.message).then(function (yes) {
+            if (yes && current()) {
+              state.discardResumeOnRun = true;
+              doScan(confirm, force);
+            }
           });
         } else if (e.data && e.data.reason === "deleted_ratio") {
           state.plan = null;
@@ -546,7 +743,7 @@
             $("btnRun").disabled = !$("chkForce").checked;
           };
           $("btnRun").onclick = function () {
-            if ($("chkForce").checked) doScan(confirm, true);
+            if ($("chkForce").checked && current()) doScan(confirm, true);
           };
         } else {
           toast(e.message || "比对失败", true);
@@ -556,9 +753,10 @@
 
   // 轮询异步比对进度（大目录几十秒，必须让用户看到它在动）
   function pollScan(jid, token) {
-    if (token !== state.scanToken) return;   // 已重选目录/重开流程，停止旧轮询
+    function current() { return token === state.scanToken && state.job && state.job.id === jid && !state.running; }
+    if (!current()) return;
     api("GET", "api/jobs/" + jid + "/scan-status").then(function (s) {
-      if (token !== state.scanToken) return;
+      if (!current()) return;
       if (s.phase === "done") {
         state.plan = s.plan;
         renderPlan(s.plan);
@@ -578,7 +776,7 @@
       setPickStatus(txt);
       setTimeout(function () { pollScan(jid, token); }, 800);
     }).catch(function (e) {
-      if (token !== state.scanToken) return;
+      if (!current()) return;
       setPickStatus(null);
       toast(e.message || "获取比对进度失败", true);
     });
@@ -674,8 +872,10 @@
         if (xhr.status >= 200 && xhr.status < 300) settle(resolve);
         else {
           var msg = "HTTP " + xhr.status;
-          try { msg = JSON.parse(xhr.responseText).message || msg; } catch (e) {}
+          var response;
+          try { response = JSON.parse(xhr.responseText); msg = response.message || msg; } catch (e) {}
           var err = new Error(msg); err.status = xhr.status; err.resp = xhr.responseText;
+          err.data = response && response.data;
           settle(reject, err);
         }
       };
@@ -724,7 +924,8 @@
     logBox.scrollTop = logBox.scrollHeight;
   }
 
-  function prepareNativeDirectories(job, uploads, progress) {
+  function prepareNativeDirectories(job, uploads, progress, generation) {
+    generation = generation || (state.plan && state.plan.generation);
     var index = 0, processed = 0, made = 0, completed = 0, failure = null;
     var batches = Math.ceil(uploads.length / MKDIRS_BATCH_MAX);
     function worker() {
@@ -734,7 +935,8 @@
       var paths = uploads.slice(start, start + MKDIRS_BATCH_MAX).map(function (item) { return item[0]; });
       index += paths.length;
       var batch = Math.floor(start / MKDIRS_BATCH_MAX) + 1;
-      return api("POST", "api/jobs/" + job.id + "/mkdirs", { paths: paths }).then(function (result) {
+      return api("POST", "api/jobs/" + job.id + "/mkdirs",
+        { paths: paths, generation: generation }).then(function (result) {
         if (state.cancel) throw { cancelled: true };
         if (!result || result.processed !== paths.length) {
           throw new Error("目录准备未覆盖全部文件，请更新插件后重试");
@@ -770,18 +972,22 @@
         return;
       }
     }
-    if (state.sourcePath && !state.resumeRunId) {
+    if (!state.resumeRunId) {
       state.running = true;
       $("btnRun").disabled = true;
       var selectedMode = document.querySelector('input[name="delMode"]:checked');
       api("POST", "api/jobs/" + state.job.id + "/resume", {
         scan_id: state.plan.scan_id,
+        generation: state.plan.generation,
         source_path: state.sourcePath,
+        source_kind: state.sourcePath ? "native" : "browser",
         del_mode: selectedMode ? selectedMode.value : "del",
         prune_excluded: $("chkPruneExcluded").checked,
         replace: state.discardResumeOnRun
       }).then(function (info) {
         state.resumeRunId = info.run_id;
+        info.source_kind = info.source_kind || (state.sourcePath ? "native" : "browser");
+        state.resumeInfo = info;
         state.discardResumeOnRun = false;
         state.running = false;
         runUploadActive();
@@ -798,6 +1004,11 @@
   function runUploadActive() {
     if (state.running || !state.plan) return;
     var job = state.job, plan = state.plan;
+    var generation = plan.generation;
+    if (!/^[0-9a-f]{32}$/.test(generation || "")) {
+      toast("备份计划缺少运行标识，请刷新后继续备份或重新扫描", true);
+      return;
+    }
     var delModeEl = document.querySelector('input[name="delMode"]:checked');
     var delMode = delModeEl ? delModeEl.value : "del";       // del=改名保留 / delete=直接删除
     var applyDel = plan.deleted.length > 0 && delMode;
@@ -819,6 +1030,7 @@
     var totalBytes = (plan.upload_bytes || 0) + doneBytes || 1;
     var totalCount = plan.upload.length + okCount;
     var failed = [], delCount = plan.previous_deleted || 0;
+    var planError = null;
     var speed = { last: t0, bytes: 0, val: 0 };
     var paintTimer = null, lastPaint = -1000, pendingPhase = "", pendingFile;
 
@@ -859,8 +1071,9 @@
       var size = ent.size, mtime = ent.mtime;
       var isNative = state.sourcePath && !ent.file && !getPcFs();
       var nativeCommitted = false;
-      var url = "api/jobs/" + job.id + "/data?path=" + encodeURIComponent(rel) + "&offset=";
-      var checkSource = ((state.isResuming && !isNative) || (isNative && size === 0))
+      var url = "api/jobs/" + job.id + "/data?path=" + encodeURIComponent(rel) +
+        "&generation=" + encodeURIComponent(generation) + "&offset=";
+      var checkSource = ((state.isResuming && state.sourcePath && !isNative) || (isNative && size === 0))
         ? nativeStat(getBridge(), ent.abs, true).then(function (st) {
             if (st.size !== size || Math.abs(Math.floor(st.mtimeMs) - mtime) > 1) {
               throw new Error("PC 文件已变化，请重新扫描目录");
@@ -869,9 +1082,13 @@
         : Promise.resolve();
       return checkSource.then(function () {
         if (isNative || (state.sourcePath && !state.isResuming)) return 0;
-        return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
+        return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel) +
+          "&generation=" + encodeURIComponent(generation))
           .then(function (d) { return (d && d.size && d.size <= size) ? d.size : 0; })
-          .catch(function () { return 0; });
+          .catch(function (e) {
+            if (e && e.data && e.data.reason === "transfer_stale") throw e;
+            return 0;
+          });
       })
         .then(function (offset) {
           if (offset > 0) log("续传 @" + fmtBytes(offset) + " " + rel, "lg-skip");
@@ -906,7 +1123,7 @@
               };
             })();
             return uploadViaNative(job, ent, rel, size, mtime, offset,
-              function (p) { speedProbe.tick(p); })
+              function (p) { speedProbe.tick(p); }, generation)
               .then(function () {
                 nativeCommitted = true;
                 speedProbe.settle();
@@ -939,7 +1156,8 @@
         .then(function () {
           if (nativeCommitted) return;
           return withRetry(function () {
-            return api("POST", "api/jobs/" + job.id + "/commit", { p: rel, s: size, m: mtime });
+            return api("POST", "api/jobs/" + job.id + "/commit",
+              { p: rel, s: size, m: mtime, generation: generation });
           }, "确认文件 " + rel);
         })
         .then(function () {
@@ -954,7 +1172,8 @@
         if (state.cancel || !paths.length) return Promise.resolve();
         var cur = paths.splice(0, 200);
         return withRetry(function () {
-          return api("POST", "api/jobs/" + job.id + "/deleted", { paths: cur, mode: delMode });
+          return api("POST", "api/jobs/" + job.id + "/deleted",
+            { paths: cur, mode: delMode, generation: generation });
         }, "处理删除").then(function (res) {
           (res || []).forEach(function (r) {
             if (r.status === "renamed") { delCount++; log("⟲ " + r.p + " → .del", "lg-del"); }
@@ -973,6 +1192,15 @@
         return tombstoneAll();
       });
     }
+    if (Object.keys(plan.type_archives || {}).length) {
+      chain = chain.then(function () {
+        setProgress("整理目标目录…", "保留同名旧目录，再继续上传");
+        return withRetry(function () {
+          return api("POST", "api/jobs/" + job.id + "/prepare-paths",
+            { run_id: state.resumeRunId, generation: generation });
+        }, "保留旧目录");
+      });
+    }
     // Prepare every acknowledged batch before starting native workers.
     if (state.sourcePath && !getPcFs() && plan.upload.length) {
       chain = chain.then(function () {
@@ -985,7 +1213,7 @@
             n + " / " + total + " 个文件路径";
           setProgress("准备目录…", text);
           log("[准备目录] 批次 " + info.batch + " / " + info.batches + " 完成；" + text, "lg-skip");
-        })
+        }, generation)
           .then(function (r) {
             log("[准备目录] 全部完成，新增 " + r.created + " 个目标父目录", "lg-ok");
           });
@@ -997,11 +1225,17 @@
       }
       var queue = plan.upload.slice();
       function worker() {
-        if (state.cancel || !queue.length) return Promise.resolve();
+        if (state.cancel || planError || !queue.length) return Promise.resolve();
         var item = queue.shift();
         setProgress("上传中", item[0]);
         return uploadOne(item).catch(function (e) {
           if (e && e.cancelled) return;
+          if (e && e.data && e.data.reason === "transfer_stale") {
+            planError = e;
+            state.cancel = true;
+            abortAllUploads();
+            return;
+          }
           failed.push(item[0]);
           log("✗ " + item[0] + " — " + (e.message || e), "lg-err");
         }).then(worker);
@@ -1010,7 +1244,7 @@
       // 不要用 queue.length 当循环条件：worker() 同步 shift 会让队列中途变短，
       // 固定启动槽位，避免小队列少启动 worker。
       for (var w = 0; w < UPLOAD_CONCURRENCY; w++) workers.push(worker());
-      return Promise.all(workers);
+      return Promise.all(workers).then(function () { if (planError) throw planError; });
     });
 
     chain.catch(function (e) {
@@ -1018,16 +1252,24 @@
       throw e;
     }).then(function () {
       var elapsed = Date.now() - t0;
-      setProgress(state.cancel ? "已取消" : "完成", "", true);
-      return api("POST", "api/jobs/" + job.id + "/finish", {
+      setProgress("收尾校验中…", "正在确认备份结果，请等待服务端校验完成", true);
+      return finishAndWait(job, {
         run_id: state.resumeRunId,
+        generation: generation,
         uploaded: okCount, uploaded_bytes: doneBytes, skipped: plan.skipped,
         adopted: plan.adopted || 0,
         deleted: delCount, failed: failed.length, elapsed_ms: elapsed,
         cancelled: state.cancel,
         prune_excluded: $("chkPruneExcluded").checked && (plan.excluded_kept || 0) > 0
       }).then(function (entry) {
+        if (!entry || ["ok", "partial", "cancelled"].indexOf(entry.status) < 0) {
+          throw new Error("服务端尚未确认备份结果，请刷新后检查");
+        }
         if (entry.status === "partial" && !failed.length) throw new Error("仍有未完成文件，可再次继续备份");
+        state.cancel = entry.status === "cancelled" || !!entry.cancelled;
+        if (entry.status === "ok") { state.resumeRunId = null; state.resumeInfo = null; }
+        else if (state.resumeInfo) state.resumeInfo.needsRefresh = true;
+        setProgress(state.cancel ? "已取消" : (failed.length ? "部分失败" : "完成"), "", true);
       });
     }).then(function () {
       state.running = false;
@@ -1193,16 +1435,16 @@
   function nativeListDir(api, pcPath) {
     return new Promise(function (resolve, reject) {
       var done = false;
-      function ok(v) { if (!done) { done = true; resolve(v); } }
-      function bad(e) { if (!done) { done = true; reject(e instanceof Error ? e : new Error("目录读取失败")); } }
+      var timer = setTimeout(function () { bad(new Error("目录读取超时")); }, 600000);
+      function ok(v) { if (!done) { done = true; clearTimeout(timer); resolve(v); } }
+      function bad(e) { if (!done) { done = true; clearTimeout(timer); reject(e instanceof Error ? e : new Error("目录读取失败")); } }
       try {
         var r = api.getPcFileList({ pcPath: pcPath, tag: "lst_" + Date.now() },
           function () {}, ok, bad);
         if (r && typeof r.then === "function") {
-          r.then(function (v) { if (v !== undefined) ok(v); }).catch(function () {});
+          r.then(function (v) { if (v !== undefined) ok(v); }).catch(bad);
         }
       } catch (e) { bad(e); }
-      setTimeout(function () { if (!done) bad(new Error("目录读取超时")); }, 600000);
     });
   }
 
@@ -1389,7 +1631,8 @@
     });
   }
 
-  function uploadViaNative(job, ent, rel, size, mtime, offset, onProgress) {
+  function uploadViaNative(job, ent, rel, size, mtime, offset, onProgress, generation) {
+    generation = generation || (state.plan && state.plan.generation);
     var bridge = getBridge();
     if (!bridge || typeof bridge.upLoadToNas !== "function") {
       return Promise.reject(new Error("桌面端缺少原生上传接口，无法传输大文件"));
@@ -1408,7 +1651,8 @@
     return checkSource().then(function () {
       return withRetry(function () {
         return api("POST", "api/jobs/" + job.id + "/native-upload",
-          { action: "prepare", p: rel, s: size, m: mtime, source: ent.abs, run_id: state.resumeRunId || "" });
+          { action: "prepare", p: rel, s: size, m: mtime, source: ent.abs,
+            run_id: state.resumeRunId || "", generation: generation });
       }, "准备原生上传 " + rel);
     }).then(function (prepared) {
       info = prepared;
@@ -1438,7 +1682,7 @@
       return withRetry(function () {
         return checkSource().then(function () {
           return api("POST", "api/jobs/" + job.id + "/native-upload",
-            { action: "finalize", p: rel, token: info.token });
+            { action: "finalize", p: rel, token: info.token, generation: generation });
         });
       }, "确认原生文件 " + rel).then(function (result) {
         if (!result || !result.committed) throw new Error("原生上传确认响应无效，请更新插件");
@@ -1452,14 +1696,19 @@
   }
 
   // 原生读取入口：整树 → 排除过滤 → 并发补 mtime → 走既有比对流水
-  function nativePick(pcPath) {
+  function nativePick(pcPath, pick) {
     var job = state.job;
     var bridge = getBridge();       // 注意：不能叫 api——会遮蔽同名 HTTP 助手（踩过）
     if (!bridge) { toast("该功能需在桌面 App 内使用（当前浏览器请点上方「选择文件夹」）", true); return; }
     if (!pcPath) { toast("先填 PC 目录绝对路径，或把文件夹拖进框里取路径", true); return; }
+    pick = pick || beginPick();
+    if (!currentPick(pick)) return;
+    if (state.browserResumeRequested) { $("dirInput").click(); return; }
     setPickStatus("正在读取目录：" + pcPath + " …");
     nativeListDir(bridge, pcPath).then(function (data) {
-      var files = (data && data.files) || [];
+      if (!currentPick(pick)) return;
+      if (!data || !Array.isArray(data.files)) throw new Error("目录读取结果无效，请重新选择");
+      var files = data.files;
       var rootNorm = pcPath.replace(/[\\/]+$/, "");
       var entries = [], seen = {}, skippedOut = 0;
       for (var i = 0; i < files.length; i++) {
@@ -1475,15 +1724,11 @@
         seen[rel] = 1;
         entries.push({ rel: rel, abs: full, size: files[i].size || 0, mtime: 0 });
       }
-      if (!entries.length) {
-        setPickStatus(null);
-        toast("该目录下没有可备份的文件（排除后为空）" + (skippedOut ? "；另有 " + skippedOut + " 个越界路径被跳过" : ""), true);
-        return;
-      }
       entries.sort(function (a, b) { return a.rel < b.rel ? -1 : 1; });
       setPickStatus("正在读取文件时间戳… 0 / " + entries.length);
       var t0 = Date.now(), done = 0, statFail = 0, failSamples = [];
       return mapLimit(entries, 64, function (e) {
+        if (!currentPick(pick)) return null;
         return nativeStat(bridge, e.abs).then(function (st) {
           // 必须截断到毫秒（与浏览器 File.lastModified 同口径）——
           // 四舍五入会与账本差 1ms，把约 1/4 的文件误判为变更（踩过：12711 个假变更）
@@ -1494,12 +1739,13 @@
           if (failSamples.length < 5) failSamples.push(e.abs);
         }).then(function () {
           done++;
-          if (done % 2000 === 0 || done === entries.length) {
+          if (currentPick(pick) && (done % 2000 === 0 || done === entries.length)) {
             setPickStatus("正在读取文件时间戳… " + done + " / " + entries.length +
               "（" + ((Date.now() - t0) / 1000).toFixed(0) + "s）");
           }
         });
       }).then(function () {
+        if (!currentPick(pick)) return;
         setPickStatus(null);
         if (statFail) {
           log("[目录读取] ⚠ " + statFail + " 个文件取不到 mtime（会被判变更重传）：" + failSamples.join(" | "), "lg-err");
@@ -1507,13 +1753,31 @@
         // 根目录名取末段：Windows 路径是反斜杠，必须先归一化，
         // 否则 "D:\work" 整串被当目录名，触发假的 folder_mismatch（踩过）
         var leaf = rootNorm.replace(/\\/g, "/").split("/").pop() || "目录";
-        state.sourcePath = pcPath;
-        finishPick(entries, leaf, "读取目录" + (statFail ? "（mtime 取不到 " + statFail + " 个）" : ""),
-          files.length - entries.length - skippedOut);
-        // 记住路径：下次打开任务直接用
-        api("PATCH", "api/jobs/" + job.id, { pc_path: pcPath }).catch(function () {});
+        if (!currentPick(pick)) return;
+        // Saving a source changes the request generation. Do it before scanning
+        // so the new plan cannot be invalidated by our own delayed PATCH.
+        var rememberAttempts = 0;
+        function rememberSource() {
+          if (!currentPick(pick) || job.pc_path === pcPath) return Promise.resolve();
+          return api("PATCH", "api/jobs/" + job.id,
+            { pc_path: pcPath, expected_pc_path: job.pc_path || "" }).catch(function (error) {
+              if (currentPick(pick) && error.data && error.data.reason === "source_changed" && ++rememberAttempts < RETRY_MAX) {
+                job.pc_path = error.data.pc_path;
+                return rememberSource();
+              }
+              throw error;
+            });
+        }
+        return rememberSource().then(function () {
+          if (!currentPick(pick)) return;
+          job.pc_path = pcPath;
+          state.sourcePath = pcPath;
+          finishPick(entries, leaf, "读取目录" + (statFail ? "（mtime 取不到 " + statFail + " 个）" : ""),
+            files.length - entries.length - skippedOut, pick);
+        });
       });
     }).catch(function (e) {
+      if (!currentPick(pick)) return;
       setPickStatus(null);
       toast("读取目录失败：" + (e && e.message), true);
     });
@@ -1528,6 +1792,8 @@
   // 任何分支，结果永远收不到——30 秒兜底超时报「没有捕获到选择结果」。
   var _browseBusy = false;
   function nativeBrowse() {
+    if (state.running) { toast("正在传输，先取消再重新选目录", true); return; }
+    if (state.browserResumeRequested) { $("dirInput").click(); return; }
     var bridge = getBridge();
     if (!bridge) { toast("「浏览…」需在桌面 App 内使用", true); return; }
     if (typeof bridge.openFileDialog !== "function") {
@@ -1535,6 +1801,7 @@
       return;
     }
     if (_browseBusy) return;   // dialog 回调是一次性 once，防重复弹框串结果
+    var pick = beginPick();
     _browseBusy = true;
     var armed = false;
     function done() { _browseBusy = false; }
@@ -1542,12 +1809,13 @@
       bridge.openFileDialog(function (v) {
         armed = true;
         done();
-        if (!v || v.canceled) return;
+        if (!currentPick(pick)) return;
+        if (!v || v.canceled) { setPickStatus(null); return; }
         var p = extractWinPath(v);
         if (p) {
           $("npPickPath").value = p;
           toast("✓ 选目录成功：" + p);
-          nativePick(p);   // 显式选好目录＝确认，直接开始
+          nativePick(p, pick);   // 显式选好目录＝确认，直接开始
         } else {
           toast("没有捕获到选择结果", true);
         }
@@ -1600,25 +1868,30 @@
 
   function traverseEntry(entry, onFile) {
     // 递归读取拖入的目录项，返回 Promise<[{rel, file}]>
-    return new Promise(function (resolve) {
+    return new Promise(function (resolve, reject) {
+      function failed() { reject(new Error("无法读取 " + (entry.fullPath || entry.name) + "，请检查后重新选择目录")); }
       if (entry.isFile) {
         entry.file(function (f) {
           f._relPath = entry.fullPath.replace(/^\//, "");
           if (onFile) onFile();
           resolve([{ rel: f._relPath, file: f }]);
-        }, function () { resolve([]); });
+        }, failed);
       } else if (entry.isDirectory) {
         var reader = entry.createReader();
         var all = [];
         function readBatch() {
           reader.readEntries(function (batch) {
             if (!batch.length) {
-              Promise.all(all).then(function (xs) { resolve([].concat.apply([], xs)); });
+              Promise.all(all).then(function (xs) { resolve([].concat.apply([], xs)); }, reject);
               return;
             }
-            batch.forEach(function (e) { all.push(traverseEntry(e, onFile)); });
+            batch.forEach(function (e) {
+              var pending = traverseEntry(e, onFile);
+              pending.catch(function () {}); // Observe errors before the reader delivers its final batch.
+              all.push(pending);
+            });
             readBatch();
-          }, function () { resolve([]); });
+          }, failed);
         }
         readBatch();
       } else {
@@ -1634,7 +1907,8 @@
     dz.addEventListener("click", function (e) {
       // 输入框/按钮区域的点击不触发选择框
       if (e.target.closest && e.target.closest(".np-entry")) return;
-      if (getBridge()) { nativeBrowse(); return; }
+      if (state.running) { toast("正在传输，先取消再重新选目录", true); return; }
+      if (getBridge() && !state.browserResumeRequested) { nativeBrowse(); return; }
       setPickStatus("正在打开文件夹选择器——选择目录后，浏览器需要时间读取文件（大目录可能几十秒），期间界面可能短暂无响应，请耐心等待，不是死机…");
       input.click();
     });
@@ -1644,6 +1918,8 @@
       // 否则分块筛选从第二块起读到 undefined（TypeError 链条中断）
       var picked = Array.prototype.slice.call(input.files);
       input.value = "";
+      var pick = beginPick();
+      if (!pick) return;
       var root = "";
       for (var i = 0; i < picked.length; i++) {
         var rp = picked[i].webkitRelativePath || picked[i].name;
@@ -1651,12 +1927,12 @@
       }
       setPickStatus("正在读取目录（" + picked.length + " 个文件）…");
       setTimeout(function () {
-        onPicked(picked, root || "目录");
+        onPicked(picked, root || "目录", pick);
       }, 30);
     });
 
     // 经典拖拽：读 File 对象走 webkitdirectory 同款流水
-    function classicDrop(e) {
+    function classicDrop(e, pick) {
       var items = e.dataTransfer && e.dataTransfer.items;
       if (!items || !items.length) return;
       var entries = [];
@@ -1668,6 +1944,7 @@
       if (!entries.length) return;
       var found = 0, lastUpd = 0;
       var onFile = function () {
+        if (!currentPick(pick)) return;
         found++;
         var now = Date.now();
         if (now - lastUpd > 200) {
@@ -1677,13 +1954,17 @@
       };
       setPickStatus("正在读取拖入的目录…");
       Promise.all(entries.map(function (en) { return traverseEntry(en, onFile); })).then(function (xs) {
+        if (!currentPick(pick)) return;
         var flat = [].concat.apply([], xs);
-        if (!flat.length) { setPickStatus(null); toast("没有读到文件", true); return; }
         var files = flat.map(function (x) { return x.file; });
         // 多个拖入项时用第一项名字当根目录
         var fake = { length: files.length };
         for (var j = 0; j < files.length; j++) fake[j] = files[j];
-        onPicked(fake, rootName);
+        onPicked(fake, rootName, pick);
+      }).catch(function (error) {
+        if (!currentPick(pick)) return;
+        setPickStatus(null);
+        toast("读取目录失败：" + error.message, true);
       });
     }
 
@@ -1694,19 +1975,22 @@
       dz.addEventListener(ev, function (e) { e.preventDefault(); e.stopPropagation(); dz.classList.remove("drag"); });
     });
     dz.addEventListener("drop", function (e) {
+      var pick = beginPick();
+      if (!pick) return;
       // 桌面 App 内优先取绝对路径走原生读取（显式拖放＝确认）；取不到回退经典读取
-      if (getBridge()) {
+      if (getBridge() && !state.browserResumeRequested) {
         nativeDropPath(e).then(function (p) {
+          if (!currentPick(pick)) return;
           if (p) {
             $("npPickPath").value = p;
-            nativePick(p);
+            nativePick(p, pick);
           } else {
-            classicDrop(e);
+            classicDrop(e, pick);
           }
         });
         return;
       }
-      classicDrop(e);
+      classicDrop(e, pick);
     });
   }
 
@@ -1716,7 +2000,11 @@
     $("btnNewJob").addEventListener("click", function () { openJobModal(null); });
     $("btnResume").addEventListener("click", resumeBackup);
     $("btnResumeFresh").addEventListener("click", function () {
+      state.pickToken = (state.pickToken || 0) + 1;
+      state.scanToken = (state.scanToken || 0) + 1;
       state.resumeInfo = null;
+      state.resumeRunId = null;
+      state.browserResumeRequested = false;
       state.discardResumeOnRun = true;
       $("stepResume").hidden = true;
       $("stepPick").hidden = false;
@@ -1730,6 +2018,7 @@
     $("btnBackFromBrowse").addEventListener("click", function () { show("view-jobs"); });
     $("btnRepick").addEventListener("click", function () {
       if (state.running) { toast("正在传输，先取消再重新选目录", true); return; }
+      beginPick();
       resetSteps();
     });
     $("btnCancel").addEventListener("click", function () {

@@ -48,9 +48,15 @@ cp "${HOME_DIR}/src/ui/icon.png" "$ICON_DST"
 chown "${USER_NAME}:${USER_NAME}" "$ICON_DST" 2>/dev/null || true
 
 echo "==> [4/8] 注册 .list 条目"
-python3 - "$LIST_FILE" "$PLUGIN" "$UID_NUM" "$PORT" "${BACKUP_DIR}" <<'PY'
+python3 - "$LIST_FILE" "$PLUGIN" "$UID_NUM" "$PORT" "${BACKUP_DIR}" "${HOME_DIR}/INFO" <<'PY'
 import json, time, sys, os
-path, plugin, uid, port, backup_dir = sys.argv[1:6]
+path, plugin, uid, port, backup_dir, info_path = sys.argv[1:7]
+with open(info_path, encoding="utf-8") as stream:
+    info = json.load(stream)
+if (not isinstance(info, dict) or info.get("plugin") != plugin
+        or not isinstance(info.get("version"), str) or not info["version"].strip()
+        or not isinstance(info.get("changelog"), str) or not info["changelog"].strip()):
+    raise ValueError("INFO 缺少有效的插件、版本或更新说明，未更新注册条目")
 home = f"/home/u{uid}/plugin/{plugin}"
 desc = "把电脑目录增量备份到 NAS：只上传新增/修改的文件，未变更自动跳过，电脑上已删除的文件在 NAS 端标记为 .del"
 data = {}
@@ -71,10 +77,10 @@ entry = {
         "sortid": 32, "widget": []
     },
     "info": {
-        "plugin": plugin, "name": "PC 备份", "id": 96, "version": "1.3.6",
+        "plugin": plugin, "name": "PC 备份", "id": 96, "version": info["version"],
         "tags": ["backup", "tool"], "timestamp": int(time.time()),
         "desc": desc, "developer": "YourName", "publisher": "minas",
-        "changelog": "1.3.6 修复卡死/内存暴涨/取消无效", "system": False, "size": 40000,
+        "changelog": info["changelog"], "system": False, "size": 40000,
         "port": port, "type": "standard", "forceupgrade": False, "ext": {}
     }
 }

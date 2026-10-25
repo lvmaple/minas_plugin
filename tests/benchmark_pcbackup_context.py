@@ -34,7 +34,8 @@ def measure(backend, count, lookups, files):
         backend.save_jobs({job["id"]: job})
         entries = [["benchmark/" + "nested-directory/" * 8 + "%06d-document.bin" % n, 1024, 1700000000000]
                    for n in range(count)]
-        backend._save_json(backend.resume_path(job), {"version": 1, "run_id": "benchmark-run", "files": entries})
+        run_id = "benchmark-run"
+        backend._save_json(backend.resume_path(job), {"version": 1, "run_id": run_id, "files": entries})
         size = Path(backend.resume_path(job)).stat().st_size
         stages = {}
         with patch.object(backend, "load_resume", wraps=backend.load_resume) as load:
@@ -61,7 +62,7 @@ def measure(backend, count, lookups, files):
                 # All paths and metadata belong to the saved plan.
                 rel, size, mtime = entries[n]
                 body = {"p": rel, "s": size, "m": mtime,
-                        "source": "D:\\benchmark\\%06d.bin" % n, "run_id": "benchmark-run"}
+                        "source": "D:\\benchmark\\%06d.bin" % n, "run_id": run_id}
                 code, prepared = backend.prepare_native_upload(job, body)
                 assert code == 200, prepared
                 stage = root / "pool/.temp_upload_dir" / prepared["ready_name"]
@@ -77,6 +78,29 @@ def measure(backend, count, lookups, files):
                 seconds = time.perf_counter() - wall
                 stages["pipeline"] = {"files": files, "seconds": seconds, "files_per_second": files / seconds,
                                       "cpu_ms": (time.process_time() - cpu) * 1000, "full_plan_reads": load.call_count}
+                # A normal incremental modification must not create one useless
+                # retirement file per already-completed native upload.
+                entries = [[p, s, m + 1000] for p, s, m in entries]
+                run_id = "benchmark-modified"
+                record = {"version": 1, "run_id": run_id, "files": entries}
+                backend._save_json(backend.resume_path(job), record)
+                with backend._job_lock(job["id"]):
+                    if hasattr(backend, "_remember_resume_id"):
+                        backend._remember_resume_id(job, record)
+                load.reset_mock()
+                retired_writes = []
+                original_save = backend._save_json
+                def track_save(path, value):
+                    if "native-retired" in str(path):
+                        retired_writes.append(path)
+                    return original_save(path, value)
+                wall, cpu = time.perf_counter(), time.process_time()
+                with patch.object(backend, "_save_json", side_effect=track_save):
+                    with ThreadPoolExecutor(max_workers=6) as pool:
+                        list(pool.map(upload, range(files)))
+                stages["modified_pipeline"] = {"files": files, "seconds": time.perf_counter() - wall,
+                    "cpu_ms": (time.process_time() - cpu) * 1000, "full_plan_reads": load.call_count,
+                    "retirement_json_writes": len(retired_writes)}
         return {"checkpoint_entries": count, "checkpoint_bytes": size, "workers": 6, "stages": stages}
 
 
@@ -97,6 +121,8 @@ def main():
             assert result["stages"]["cold"]["full_plan_reads"] == 1
             assert result["stages"]["warm"]["full_plan_reads"] == 0
         assert results[1]["stages"]["pipeline"]["full_plan_reads"] == 0
+        assert results[1]["stages"]["modified_pipeline"]["full_plan_reads"] == 0
+        assert results[1]["stages"]["modified_pipeline"]["retirement_json_writes"] == 0
     print(json.dumps({"version": backend.PLUGIN_VERSION, "source": str(args.source), "isolated": True,
                       "simulated_data_arrival": True, "results": results}, indent=2))
 

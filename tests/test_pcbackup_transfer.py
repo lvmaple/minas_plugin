@@ -166,6 +166,227 @@ class TransferTests(unittest.TestCase):
         self.assertEqual(self.finalize(second)[0], 200)
         self.assertEqual((Path(self.job["destination"]) / self.body["p"]).read_bytes(), b"newer")
 
+    def test_superseded_native_attempt_is_recorded_before_its_reference_is_replaced(self):
+        first = self.prepare()
+        old = self.stage(first, b"he")
+        second = self.prepare()
+        self.assertNotEqual(first["token"], second["token"])
+        ledger = Path(backend.DATA_DIR) / "native-retired" / (first["token"] + ".json")
+        self.assertTrue(ledger.is_file(), "superseding an upload must retain its ownership for delayed cleanup")
+        retired = json.loads(ledger.read_text(encoding="utf-8"))
+        self.assertEqual(retired["job_id"], self.job["id"])
+        self.assertEqual(retired["token"], first["token"])
+        self.assertEqual(old.read_bytes(), b"he", "retirement must not delete an in-flight upload")
+
+    def retired_attempt(self):
+        first = self.prepare()
+        old = self.stage(first, b"he")
+        with patch.object(backend.time, "time", return_value=1000000):
+            second = self.prepare()
+        os.utime(old, (1000000, 1000000))
+        ledger = Path(backend.DATA_DIR) / "native-retired" / (first["token"] + ".json")
+        self.assertTrue(ledger.is_file(), "a retired attempt must remain recoverable after restart")
+        return first, old, second, ledger
+
+    def test_retired_native_cleanup_preserves_current_upload_backup_and_unknown_files(self):
+        first, old, second, ledger = self.retired_attempt()
+        ready = self.stage(first, b"hello", ready=True)
+        os.utime(ready, (1000000, 1000000))
+        current = self.stage(second, b"wo")
+        os.utime(current, (1000000, 1000000))
+        foreign = old.parent / ("pcb_" + "f" * 32 + ".ready")
+        foreign.write_bytes(b"unowned legacy upload")
+        backup = Path(self.job["destination"]) / "keep.txt"
+        backup.write_bytes(b"existing backup")
+        removed = backend.cleanup_native_uploads(now=1000000 + 8 * 86400)
+        self.assertEqual(removed, 2)
+        self.assertFalse(old.exists())
+        self.assertFalse(ready.exists())
+        self.assertFalse(ledger.exists())
+        self.assertEqual(current.read_bytes(), b"wo")
+        self.assertEqual(foreign.read_bytes(), b"unowned legacy upload")
+        self.assertEqual(backup.read_bytes(), b"existing backup")
+
+    def test_retired_native_cleanup_waits_for_grace_and_recent_late_writes(self):
+        _, old, _, ledger = self.retired_attempt()
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 7 * 86400 - 1), 0)
+        old.write_bytes(b"late write from obsolete upload")
+        now = 1000000 + 8 * 86400
+        os.utime(old, (now, now))
+        self.assertEqual(backend.cleanup_native_uploads(now=now), 0)
+        self.assertTrue(ledger.exists())
+        self.assertEqual(backend.cleanup_native_uploads(now=now + 7 * 86400 + 1), 1)
+        self.assertFalse(old.exists())
+
+    def test_retirement_write_failure_keeps_old_reference_and_can_retry(self):
+        first = self.prepare()
+        old = self.stage(first, b"he")
+        original = backend._save_json
+        def fail_retire(path, value):
+            if "native-retired" in str(path):
+                raise OSError("retirement disk unavailable")
+            return original(path, value)
+        with patch.object(backend, "_save_json", side_effect=fail_retire):
+            with self.assertRaises(OSError):
+                self.prepare()
+        record = backend._load_json(backend._native_record_path(self.job, self.body["p"]), {})
+        self.assertEqual(record["token"], first["token"])
+        self.assertEqual(old.read_bytes(), b"he")
+        self.assertNotEqual(self.prepare()["token"], first["token"])
+
+    def test_failed_replacement_cannot_collect_a_still_referenced_native_upload(self):
+        first = self.prepare()
+        old = self.stage(first, b"he")
+        original = backend._save_json
+        record_path = backend._native_record_path(self.job, self.body["p"])
+        def fail_replace(path, value):
+            if path == record_path:
+                raise OSError("new upload record unavailable")
+            return original(path, value)
+        with patch.object(backend.time, "time", return_value=1000000), \
+                patch.object(backend, "_save_json", side_effect=fail_replace):
+            with self.assertRaises(OSError):
+                self.prepare()
+        os.utime(old, (1000000, 1000000))
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 0)
+        self.assertEqual(old.read_bytes(), b"he")
+        self.assertEqual(backend._load_json(record_path, {})["token"], first["token"])
+
+    def test_retired_native_cleanup_retries_failed_unlink_without_losing_ownership(self):
+        _, old, _, ledger = self.retired_attempt()
+        original = backend.os.remove
+        def fail_unlink(path):
+            if os.fspath(path) == str(old):
+                raise OSError("temporary unlink failure")
+            return original(path)
+        with patch.object(backend.os, "remove", side_effect=fail_unlink):
+            self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 0)
+        self.assertTrue(ledger.is_file())
+        self.assertEqual(old.read_bytes(), b"he")
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 1)
+        self.assertFalse(ledger.exists())
+
+    def test_retired_native_cleanup_does_not_hide_current_record_read_failures(self):
+        _, old, _, ledger = self.retired_attempt()
+        record_path = backend._native_record_path(self.job, self.body["p"])
+        original = open
+        def fail_read(path, *args, **kwargs):
+            if os.fspath(path) == record_path:
+                raise OSError("temporary record read failure")
+            return original(path, *args, **kwargs)
+        with patch("builtins.open", side_effect=fail_read):
+            self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 0)
+        self.assertTrue(ledger.exists())
+        self.assertEqual(old.read_bytes(), b"he")
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 1)
+
+    def test_native_retirement_cleanup_recovers_from_disk_in_a_fresh_process(self):
+        _, old, _, _ = self.retired_attempt()
+        script = """
+import importlib.util, sys
+spec = importlib.util.spec_from_file_location('gc_restart', sys.argv[1])
+b = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(b)
+b.DATA_DIR, b.JOBS_DIR, b.USER_DATA_ROOT = sys.argv[2:5]
+assert b.cleanup_native_uploads(now=1000000 + 8 * 86400) == 1
+"""
+        out = subprocess.run([sys.executable, "-X", "utf8", "-c", script, str(SOURCE),
+                              backend.DATA_DIR, backend.JOBS_DIR, backend.USER_DATA_ROOT],
+                             capture_output=True, text=True)
+        self.assertEqual(out.returncode, 0, out.stderr)
+        self.assertFalse(old.exists())
+
+    def test_deleting_job_retires_native_data_without_deleting_backup_or_current_bytes(self):
+        first = self.prepare()
+        old = self.stage(first, b"he")
+        backup = Path(self.job["destination"]) / "keep.txt"
+        backup.write_bytes(b"existing backup")
+        with patch.object(backend.time, "time", return_value=1000000):
+            self.assertEqual(backend.delete_job(self.job["id"], False)[0], 200)
+        os.utime(old, (1000000, 1000000))
+        self.assertEqual(old.read_bytes(), b"he")
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 1)
+        self.assertEqual(backup.read_bytes(), b"existing backup")
+
+    def test_native_retirement_during_delete_does_not_block_other_job_changes(self):
+        entered, release = threading.Event(), threading.Event()
+        other = dict(self.job, id="5678abcd", name="other")
+        backend.save_jobs({self.job["id"]: self.job, other["id"]: other})
+        def blocked_retirement(job):
+            entered.set()
+            self.assertTrue(release.wait(5))
+        with patch.object(backend, "_retire_job_uploads", side_effect=blocked_retirement):
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                deleting = pool.submit(backend.delete_job, self.job["id"], False)
+                try:
+                    self.assertTrue(entered.wait(3))
+                    editing = pool.submit(backend.update_job, other["id"], {"name": "renamed"})
+                    self.assertEqual(editing.result(timeout=1)[0], 200)
+                finally:
+                    release.set()
+                self.assertEqual(deleting.result(timeout=3)[0], 200)
+
+    def test_delete_retirement_failure_preserves_task_and_upload_for_retry(self):
+        first = self.prepare()
+        old = self.stage(first, b"he")
+        original = backend._save_json
+        def fail_retire(path, value):
+            if "native-retired" in str(path):
+                raise OSError("retirement disk unavailable")
+            return original(path, value)
+        with patch.object(backend, "_save_json", side_effect=fail_retire):
+            with self.assertRaises(OSError):
+                backend.delete_job(self.job["id"], False)
+        self.assertIn(self.job["id"], backend.load_jobs())
+        self.assertEqual(old.read_bytes(), b"he")
+        self.assertEqual(backend.delete_job(self.job["id"], False)[0], 200)
+
+    def test_native_cleanup_rechecks_identity_before_unlinking_a_late_writer(self):
+        _, old, _, ledger = self.retired_attempt()
+        original, calls = backend.os.stat, 0
+        def late_write(path, *args, **kwargs):
+            nonlocal calls
+            if os.fspath(path) == str(old) and kwargs.get("follow_symlinks") is False:
+                calls += 1
+                if calls == 2:
+                    old.write_bytes(b"late writer changed this obsolete upload")
+            return original(path, *args, **kwargs)
+        with patch.object(backend.os, "stat", side_effect=late_write):
+            self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 0)
+        self.assertEqual(old.read_bytes(), b"late writer changed this obsolete upload")
+        self.assertTrue(ledger.exists())
+        self.assertEqual(backend.cleanup_native_uploads(now=time.time() + 8 * 86400), 1)
+
+    def test_native_cleanup_rejects_unprovable_or_outside_ownership_records(self):
+        _, old, _, ledger = self.retired_attempt()
+        original = json.loads(ledger.read_text(encoding="utf-8"))
+        for changed in ({"p": "../keep.txt"}, {"job_id": "../another"},
+                        {"data_root": str(self.root / "another-pool")},
+                        {"token": None}, {"prepared_ms": "not-a-number"},
+                        {"retired_at": float("nan")}):
+            with self.subTest(changed=changed):
+                ledger.write_text(json.dumps(dict(original, **changed)), encoding="utf-8")
+                self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 0)
+                self.assertEqual(old.read_bytes(), b"he")
+        ledger.write_text("{broken", encoding="utf-8")
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 0)
+        self.assertEqual(old.read_bytes(), b"he")
+        ledger.write_text(json.dumps(original), encoding="utf-8")
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 1)
+
+    def test_native_cleanup_preserves_old_but_current_ready_data_for_reopen_recovery(self):
+        _, old, second, _ = self.retired_attempt()
+        ready = self.stage(second, b"world", ready=True)
+        os.utime(ready, (1000000, 1000000))
+        backend._RESUME_ID_CACHE.clear()
+        self.assertEqual(backend.cleanup_native_uploads(now=1000000 + 8 * 86400), 1)
+        self.assertFalse(old.exists())
+        recovered = self.prepare()
+        self.assertEqual(recovered["token"], second["token"])
+        self.assertTrue(recovered["uploaded"])
+        self.assertEqual(self.finalize(recovered)[0], 200)
+        self.assertEqual((Path(self.job["destination"]) / self.body["p"]).read_bytes(), b"world")
+
     def test_generation_and_run_identity_reject_stale_attempts_after_restart(self):
         info = self.prepare()
         self.stage(info, ready=True)
@@ -201,6 +422,7 @@ class TransferTests(unittest.TestCase):
         backend.manifest_meta(self.job, "docs")
         backend._save_json(backend.resume_path(self.job), {
             "version": 1, "run_id": "saved-run", "destination": self.job["destination"],
+            "generation": backend._native_generation(self.job),
             "exclude": [], "folder": "docs", "source_path": r"D:\documents", "started": 1,
             "total_files": 2, "files": [[self.body["p"], 5, self.body["m"]], ["later.txt", 5, self.body["m"]]],
             "deleted": [], "skipped": 0, "repaired": 0, "adopted": 0, "excluded_kept": 0,
@@ -513,6 +735,25 @@ b.finalize_native_upload(job,{"p":body["p"],"token":info["token"]})
         self.assertFalse(info["uploaded"])
         self.assertTrue(list((Path(backend.JOBS_DIR) / self.job["id"] / "native").glob("*.json")))
 
+    def test_complete_identity_write_failure_keeps_native_stage_for_retry(self):
+        info = self.prepare()
+        stage = self.stage(info, ready=True)
+        original = backend._save_json
+
+        def fail_identity(path, value):
+            if Path(path).parent.name == "parts":
+                raise OSError("identity write failed")
+            return original(path, value)
+
+        with patch.object(backend, "_save_json", side_effect=fail_identity):
+            with self.assertRaisesRegex(OSError, "identity write failed"):
+                self.complete(info)
+        self.assertTrue(stage.exists(), "failed identity write must precede the native data move")
+        self.assertEqual(stage.read_bytes(), b"hello")
+        self.assertEqual(self.complete(info)[0], 200)
+        self.assertEqual(backend.commit_file(self.job, self.body["p"], 5, self.body["m"])[0], 200)
+        self.assertEqual((Path(self.job["destination"]) / self.body["p"]).read_bytes(), b"hello")
+
     def test_complete_recovers_full_put_when_native_move_failed(self):
         info = self.prepare()
         stage = self.stage(info)
@@ -603,9 +844,10 @@ b.finalize_native_upload(job,{"p":body["p"],"token":info["token"]})
         self.addCleanup(server.server_close)
         self.addCleanup(server.shutdown)
         prefix = "http://127.0.0.1:%d/api/jobs/%s/" % (server.server_port, self.job["id"])
+        generation = backend._native_generation(self.job)
 
         def post(route, body):
-            request = Request(prefix + route, data=json.dumps(body).encode(),
+            request = Request(prefix + route, data=json.dumps(dict(body, generation=generation)).encode(),
                               headers={"Content-Type": "application/json"})
             with urlopen(request, timeout=3) as response:
                 return json.load(response)["data"]
