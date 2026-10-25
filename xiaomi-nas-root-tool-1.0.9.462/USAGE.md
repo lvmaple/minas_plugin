@@ -40,13 +40,17 @@ python xiaomi-nas-root.py <NAS_IP>
 
 ## 清理行为
 
-成功与失败路径都会自动执行清理（经 root shell）：解除 preload 布防、移除注入共享与临时目录、清除注入的 samba 系统账号行。root shell 不可达时自动降级为两种方式：把完整清理命令写入本地 `cleanup-<IP>.sh`（可经 SMB root 共享上传执行），并打印手动提示。
+进入触发阶段后，成功与失败路径都会尝试清理（经 root shell）：解除 preload 布防，并只清除本次新建且仍符合归属检查的 SMB 记录、临时目录和精确匹配的 samba 系统账号行。清理使用读回确认的实际 ID，核对账号、口令指纹、路径、启停状态和共享属性；记录发生变化时输出 `SMB_CLEAN_SKIP`，保留配置，不误报清理成功。root shell 不可达或清理未确认成功时，把带归属检查的完整命令写入本地 `cleanup-<IP>.sh`，并打印手动提示；命令不包含临时 SMB 明文口令。
+
+SMB 新增或设置阶段若发生错误、响应不完整或读回不一致，立即停止，不猜测 ID，不自动覆盖或删除记录。此时可能留下本次暂存目录或新建的临时账号，需要先核对状态再处理。固件没有提供“仅当配置未变时写入”的原子接口，运行期间请勿同时在客户端修改 SMB 配置；预检和读回不能替代服务端的并发控制。
 
 ## 注意事项
 
 - 仅用于**自有设备**
-- 步骤②会临时创建带注入的 samba 共享（`u<uid>_2`），脚本自动清理（见上节"清理行为"）
-- 已知坑：`add_samba_account` 可能返回 2502（restart 失败）——uci 已写入，脚本自动走 `set_samba_account` 修复路径，属正常现象
+- 步骤②先调用 `get_samba_account` 和 `judge_samba_account`。已有 `u<uid>`（忽略大小写）或目标槽位已占用时停止，保留原密码、共享路径和启停状态；不把已有账号临时改作工具共享
+- 固件首次分配 ID=1，`_1` 存在时选择 ID=2。脚本核对新增响应和读回记录，将实际 ID 用于临时共享、设置和清理；设置为 `/etc` 后共享名为 `etc-<uid>`
+- `add_samba_account` 返回 2502（restart 失败）时，只有读回确认本次新建账号、路径和原有记录均符合预期，才继续修复该账号的共享路径。2509 或其他失败不再回退调用设置接口
+- `--uid` 必须与当前认证证书中的 UID 一致
 - SMB 写入依赖 Windows（net use）或 POSIX（mount cifs，需 cifs-utils）；均不可用时脚本报错并给出手动挂载指引
 
 ## 部署/运维硬规矩（真机踩坑提炼）
@@ -54,3 +58,13 @@ python xiaomi-nas-root.py <NAS_IP>
 1. **文本/二进制分流**：任何 CRLF 修复（`tr -d '\r'`）绝不允许作用于 png/ico/jpg/woff/webp 等二进制——会删掉文件内 0x0D 字节导致损坏（图标空白事故根因）
 2. **改 album DB 后重启 albumd**；member_id 必须相册内唯一（用 shot_time 微秒级），否则 `BUG: member id tree same key` 导致整体加载中止
 3. socat 会话内 systemctl restart 会 D-Bus 死锁——用 cron 一次性任务执行 systemctl 类操作
+
+## 离线回归
+
+在仓库根目录执行：
+
+```powershell
+python -B -X utf8 -m unittest discover -s tests -p test_root_tool_smb.py -v
+```
+
+测试替换 NAS 传输，禁止真实 socket 和远程进程调用。清理命令在本地 POSIX shell（Windows 可用 WSL）的临时沙箱执行，UCI、系统服务和 NAS 路径操作均被隔离；没有可用 shell 时跳过清理沙箱用例。以上验证不代表 NAS 安装或完整 Root 链验证。

