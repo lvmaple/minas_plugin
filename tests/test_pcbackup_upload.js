@@ -86,6 +86,7 @@ function harness(options = {}) {
     setInterval: (f, ms) => clock.set(f, ms, ms), clearInterval: id => clock.clear(id) });
   vm.runInContext(source.slice(0, boot) + `
     window.testHooks = { state, api, xhrPut, abortAllUploads, uploadViaNative, runUpload, runUploadActive, nativePick,
+      setPcFs: value => { _pcFs = value; },
       readResume, renderJobs, doScan, openBackup, resumeBackup, onPicked, traverseEntry, initDropzone,
       prepareNativeDirectories: typeof prepareNativeDirectories === 'function' ? prepareNativeDirectories : null,
       waitNativeUpload: typeof waitNativeUpload === 'function' ? waitNativeUpload : null,
@@ -158,6 +159,50 @@ test('a late browser filtering batch cannot overwrite a newer selection', async 
   assert.equal(h.state.entries.length, 1);
   assert.equal(h.state.entries[0].rel, 'new.txt');
   assert.equal(h.requests.filter(r => r.url.endsWith('/scan')).length, 1);
+});
+
+test('selecting the original source sends a newer confirmation before a delayed change', async () => {
+  let delayed;
+  const h = selectionHarness({ fetch: (url, opt, response) => {
+    if (opt.method === 'PATCH' && JSON.parse(opt.body).pc_path === 'E:\\docs') {
+      return new Promise(resolve => { delayed = () => resolve(response({ code: 0, data: {} })); });
+    }
+  } });
+  h.state.job = { ...job, exclude: [], pc_path: 'D:\\docs' };
+  h.bridge.getPcFileList = (input, progress, done) => done({ files: [{ fullPath: input.pcPath + '\\a.txt', size: 5 }] });
+  h.nativePick('E:\\docs'); await flush();
+  h.nativePick('D:\\docs'); await flush();
+  const bodies = h.requests.filter(r => r.opt.method === 'PATCH').map(r => JSON.parse(r.opt.body));
+  assert.equal(bodies.length, 2);
+  assert.equal(bodies[0].selection_session, bodies[1].selection_session);
+  assert.ok(bodies[1].selection_seq > bodies[0].selection_seq);
+  delayed(); await flush();
+  assert.equal(h.state.sourcePath, 'D:\\docs');
+  assert.equal(h.requests.filter(r => r.url.endsWith('/scan')).length, 1);
+});
+
+test('Node reader uses size and timestamp from the same stat after listing a growing file', async () => {
+  const os = require('node:os');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'pcbackup-growing-'));
+  try {
+    const file = path.join(dir, 'a.txt'); fs.writeFileSync(file, 'helloworld');
+    const h = selectionHarness(); h.setPcFs(fs);
+    h.state.job = { ...job, exclude: [], pc_path: dir };
+    h.bridge.getPcFileList = (input, progress, done) => done({ files: [{ fullPath: file, size: 5 }] });
+    h.bridge.getPcFileStats = (input, done) => done(fs.statSync(file));
+    h.nativePick(dir); await flush();
+    const scan = JSON.parse(h.requests.find(r => r.url.endsWith('/scan')).opt.body);
+    assert.equal(scan.files[0].s, 10);
+    Object.assign(h.state, { resumeRunId: 'node-run',
+      plan: { generation, upload: [['a.txt', 10]], deleted: [], upload_bytes: 10, skipped: 0 } });
+    h.runUploadActive();
+    for (let i = 0; i < 100 && !h.xhrs.length; i++) await new Promise(setImmediate);
+    assert.equal(await h.xhrs[0].body.text(), 'helloworld');
+    h.xhrs[0].status = 200; h.xhrs[0].onload();
+    for (let i = 0; i < 100 && h.state.running; i++) { await flush(); await new Promise(setImmediate); }
+    assert.equal(JSON.parse(h.requests.find(r => r.url.endsWith('/commit')).opt.body).s, 10);
+    assert.equal(h.nodes.get('runPhase').textContent, '完成');
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test('repicking during upload preserves the active native source', () => {
@@ -291,6 +336,69 @@ test('same-page browser continuation refreshes completed progress before reselec
   assert.ok(h.xhrs[0].url.endsWith('offset=2'));
   h.state.cancel = true; h.abortAllUploads(); await until(() => !h.state.running);
 });
+
+for (const admitted of [true, false]) {
+  test('browser continuation reconciles the original finish after all ACKs are lost: ' + admitted, async () => {
+    let offline = true, serverFinishes = 0;
+    const h = selectionHarness({ noBridge: true, fetch: (url, opt, response) => {
+      if (url.endsWith('/resume')) return Promise.resolve(response({ code: 0, data: browserResumeInfo() }));
+      if (url.includes('/part?')) return Promise.resolve(response({ code: 0, data: { size: 0 } }));
+      if (url.endsWith('/finish')) {
+        if (offline) {
+          if (admitted && !serverFinishes) serverFinishes++;
+          return Promise.reject(new Error('network disconnected'));
+        }
+        if (!serverFinishes) serverFinishes++;
+        return Promise.resolve(response({ code: 0, data: { phase: 'done', result: { status: 'ok' } } }));
+      }
+      if (url.includes('/resume?')) return Promise.resolve(response({ code: 0, data: { phase: 'done', result: null } }));
+    } });
+    Object.assign(h.state, { job: { ...job, exclude: [] }, folder: 'docs',
+      plan: { generation, scan_id: 'scan', folder: 'docs', upload: [['a.txt', 5]], deleted: [], upload_bytes: 5, skipped: 0 },
+      fileMap: { 'a.txt': { file: browserFile(), size: 5, mtime: 1000 } } });
+    h.runUpload(); await until(() => h.xhrs.length === 1);
+    h.xhrs[0].status = 200; h.xhrs[0].onload();
+    await until(() => h.requests.some(r => r.url.endsWith('/finish')));
+    for (let i = 0; i < 6 && h.state.running; i++) { await flush(); h.clock.tick(1000); }
+    await flush();
+    assert.equal(h.state.running, false);
+    assert.equal(h.state.resumeInfo.needsRefresh, true);
+    offline = false; h.onPicked([browserFile()], 'docs'); await flush();
+    assert.equal(h.xhrs.length, 1, 'completed bytes must never be resent');
+    const posts = h.requests.filter(r => r.url.endsWith('/finish'));
+    assert.equal(posts.length, 4);
+    assert.ok(posts.every(r => r.opt.body === posts[0].opt.body), 'keep original identity, stats and elapsed time');
+    assert.equal(serverFinishes, 1);
+    assert.equal(h.requests.filter(r => r.url.endsWith('/scan')).length, 1);
+    assert.equal(h.state.browserResumeRequested, false);
+    assert.equal(h.state.resumeInfo, null);
+  });
+}
+
+for (const status of ['partial', 'cancelled']) {
+  test('browser finish recovery refreshes remaining bytes after ' + status, async () => {
+    const fresh = browserResumeInfo(); fresh.plan.previous_uploaded = 1; fresh.plan.previous_bytes = 5;
+    const stats = { run_id: fresh.run_id, generation, request_id: 'b'.repeat(32),
+      uploaded: 1, elapsed_ms: 1234, cancelled: status === 'cancelled', async: true };
+    const h = harness({ noBridge: true, fetch: (url, opt, response) => {
+      if (url.endsWith('/finish')) return Promise.resolve(response({ code: 0,
+        data: { phase: 'done', result: { status } } }));
+      if (url.includes('/resume?')) return Promise.resolve(response({ code: 0, data: { phase: 'done', result: fresh } }));
+      if (url.includes('/part?')) return Promise.resolve(response({ code: 0, data: { size: 2 } }));
+    } });
+    const old = browserResumeInfo(); old.needsRefresh = true;
+    Object.assign(h.state, { job, resumeRunId: old.run_id, resumeInfo: old,
+      finishPending: { jobId: job.id, runId: old.run_id, stats }, cancel: status === 'cancelled' });
+    h.onPicked([browserFile()], 'docs'); await until(() => h.xhrs.length === 1);
+    assert.ok(h.xhrs[0].url.endsWith('offset=2'));
+    assert.equal(await h.xhrs[0].body.text(), 'llo');
+    assert.equal(h.state.plan.previous_uploaded, 1);
+    assert.equal(h.state.cancel, false, 'a new continuation can upload after old cancellation');
+    assert.equal(h.requests.filter(r => r.url.endsWith('/scan')).length, 0);
+    assert.equal(JSON.parse(h.requests.find(r => r.url.endsWith('/finish')).opt.body).request_id, stats.request_id);
+    h.state.cancel = true; h.abortAllUploads(); await until(() => !h.state.running);
+  });
+}
 
 test('type conflicts are preserved before directory batches or native uploads', async () => {
   const h = harness({ delMode: 'del', fetch: (url, opt, response) => {

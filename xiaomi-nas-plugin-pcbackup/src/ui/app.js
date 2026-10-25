@@ -17,6 +17,7 @@
   var MKDIRS_BATCH_MAX = 2000;
   var MKDIRS_CONCURRENCY = 2;
   var UPLOAD_CONCURRENCY = 6;
+  var sourceSelectionSession = operationId();
   var DEFAULT_EXCLUDES = [
     "Thumbs.db", "desktop.ini", ".DS_Store", "~$*",
     "node_modules/", ".pnpm-store/", ".venv/", "venv/", ".gradle/",
@@ -37,6 +38,7 @@
     sourcePath: "",      // 原生读取的 PC 根目录；经典 FileList 模式为空
     resumeRunId: null,
     resumeInfo: null,
+    finishPending: null,
     isResuming: false,
     browserResumeRequested: false,
     discardResumeOnRun: false,
@@ -152,7 +154,9 @@
   function finishAndWait(job, stats) {
     // Retries keep exactly the same identity and stats, including elapsed time.
     stats.async = true;
-    stats.request_id = operationId();
+    stats.request_id = stats.request_id || operationId();
+    var pending = { jobId: job.id, runId: stats.run_id, stats: stats };
+    state.finishPending = pending;
     var base = "api/jobs/" + job.id, failures = 0, networkFailures = 0, cancelSent = false;
     function request(submit) {
       var promise, cancelling = state.cancel && !stats.cancelled && !cancelSent && !submit;
@@ -181,7 +185,13 @@
         return waitSecond().then(function () { return request(submit || !!e.status); });
       });
     }
-    return request(true);
+    return request(true).then(function (entry) {
+      if (!entry || ["ok", "partial", "cancelled"].indexOf(entry.status) < 0) {
+        throw new Error("服务端尚未确认备份结果，请刷新后检查");
+      }
+      if (state.finishPending === pending) state.finishPending = null;
+      return entry;
+    });
   }
 
   function readResume(job) {
@@ -566,9 +576,21 @@
     var info = state.resumeInfo;
     if (info.needsRefresh) {
       setPickStatus("正在核对上次备份进度…");
-      return readResume(pick.job).then(function (fresh) {
+      var pending = state.finishPending;
+      var settled = pending && pending.jobId === pick.job.id && pending.runId === info.run_id
+        ? finishAndWait(pick.job, pending.stats) : Promise.resolve();
+      return settled.then(function () {
+        if (!currentPick(pick)) return null;
+        return readResume(pick.job);
+      }).then(function (fresh) {
         if (!currentPick(pick)) return;
-        if (!fresh || !fresh.run_id) throw new Error("原备份计划已结束，请重新扫描");
+        if (!fresh || !fresh.run_id) {
+          state.resumeInfo = null;
+          state.browserResumeRequested = false;
+          state.isResuming = false;
+          state.discardResumeOnRun = false;
+          return doScan(false, false);
+        }
         state.resumeInfo = fresh;
         resumeBrowserSelection(pick);
       }).catch(function (e) { if (currentPick(pick)) { setPickStatus(null); toast(e.message, true); } });
@@ -1276,6 +1298,7 @@
       renderDone(okCount, delCount, failed, plan, state.cancel, Date.now() - t0);
       loadJobs();
     }).catch(function (e) {
+      if (state.resumeInfo) state.resumeInfo.needsRefresh = true;
       setProgress("异常中断", "", true);
       log("[异常] " + (e && e.message || e), "lg-err");
       clearTimeout(paintTimer);
@@ -1730,6 +1753,7 @@
       return mapLimit(entries, 64, function (e) {
         if (!currentPick(pick)) return null;
         return nativeStat(bridge, e.abs).then(function (st) {
+          e.size = st.size;
           // 必须截断到毫秒（与浏览器 File.lastModified 同口径）——
           // 四舍五入会与账本差 1ms，把约 1/4 的文件误判为变更（踩过：12711 个假变更）
           e.mtime = Math.floor(st.mtimeMs);
@@ -1758,9 +1782,10 @@
         // so the new plan cannot be invalidated by our own delayed PATCH.
         var rememberAttempts = 0;
         function rememberSource() {
-          if (!currentPick(pick) || job.pc_path === pcPath) return Promise.resolve();
+          if (!currentPick(pick)) return Promise.resolve();
           return api("PATCH", "api/jobs/" + job.id,
-            { pc_path: pcPath, expected_pc_path: job.pc_path || "" }).catch(function (error) {
+            { pc_path: pcPath, expected_pc_path: job.pc_path || "",
+              selection_session: sourceSelectionSession, selection_seq: pick.token }).catch(function (error) {
               if (currentPick(pick) && error.data && error.data.reason === "source_changed" && ++rememberAttempts < RETRY_MAX) {
                 job.pc_path = error.data.pc_path;
                 return rememberSource();

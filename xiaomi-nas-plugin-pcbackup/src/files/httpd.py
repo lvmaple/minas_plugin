@@ -69,6 +69,7 @@ DEFAULT_EXCLUDES = (
 DEST_ALLOWED_PREFIXES = ("/nas/pool0/", "/home/", "/tmp/", "/mnt/", "/media/", "/srv/")
 
 _JOBS_LOCK = threading.RLock()
+_SOURCE_SELECTIONS = {}          # jid -> page session -> latest directory-pick sequence
 _HISTORY_LOCK = threading.RLock()
 _GENERATION_UNSET = object()
 _JOB_LOCKS = {}
@@ -2022,6 +2023,16 @@ def update_job(jid, body):
         if jid not in jobs:
             return 404, "任务不存在"
         job = jobs[jid]
+        if "selection_session" in body or "selection_seq" in body:
+            session, seq = body.get("selection_session"), body.get("selection_seq")
+            if (not isinstance(session, str) or not re.fullmatch(r"[0-9a-f]{32}", session)
+                    or type(seq) is not int or not 0 < seq <= 9007199254740991):
+                return 400, "目录选择标识非法"
+            selections = _SOURCE_SELECTIONS.setdefault(jid, {})
+            if seq < selections.get(session, 0):
+                return 409, {"reason": "selection_stale", "message": "目录选择已被更新"}
+            # Fence earlier picks even if this confirmation needs a CAS retry.
+            selections[session] = seq
         if "expected_pc_path" in body and body["expected_pc_path"] != job.get("pc_path", ""):
             return 409, {"reason": "source_changed", "pc_path": job.get("pc_path", ""),
                          "message": "备份来源已变化，请重新确认当前选择"}
@@ -2063,7 +2074,8 @@ def update_job(jid, body):
                 _bind_legacy_resume(old_job, record, _native_generation(old_job))
                 _rotate_native_generation(job)
             _MANIFEST_PATH_CACHE.pop(jid, None)
-        save_jobs(jobs)
+        if job != old_job:
+            save_jobs(jobs)
     return 200, "ok"
 
 
@@ -2096,6 +2108,7 @@ def delete_job(jid, purge):
                     continue
         jobs.pop(jid)
         save_jobs(jobs)
+        _SOURCE_SELECTIONS.pop(jid, None)
     with _job_lock(jid):
         _MANIFEST_CACHE.pop(jid, None)
         _RUN_CURRENT.pop(jid, None)

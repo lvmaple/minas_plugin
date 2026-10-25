@@ -100,6 +100,35 @@ class WorkflowTests(unittest.TestCase):
         return dict({"run_id": info["run_id"], "generation": info["generation"],
                      "request_id": uuid.uuid4().hex, "failed": 0}, **kwargs)
 
+    def test_latest_source_confirmation_fences_delayed_change_back_to_original(self):
+        session = uuid.uuid4().hex
+        plan = self.scan([{"p": "a.txt", "s": 5, "m": self.mtime}])
+        self.checkpoint(plan)
+        with patch.object(backend, "save_jobs", wraps=backend.save_jobs) as save:
+            code, out = backend.update_job(self.job["id"], {
+                "pc_path": r"D:\docs", "expected_pc_path": r"D:\docs",
+                "selection_session": session, "selection_seq": 2})
+            self.assertEqual(code, 200, out)
+            save.assert_not_called()
+        code, out = backend.update_job(self.job["id"], {
+            "pc_path": r"E:\docs", "expected_pc_path": r"D:\docs",
+            "selection_session": session, "selection_seq": 1})
+        self.assertEqual(code, 409, out)
+        self.assertEqual(out["reason"], "selection_stale")
+        self.assertEqual(backend.load_jobs()[self.job["id"]]["pc_path"], r"D:\docs")
+        self.assertEqual(backend._native_generation(self.job), plan["generation"])
+
+    def test_source_conflict_still_fences_older_selection_and_allows_same_sequence_retry(self):
+        session = uuid.uuid4().hex
+        args = {"pc_path": r"F:\docs", "expected_pc_path": r"C:\old",
+                "selection_session": session, "selection_seq": 3}
+        self.assertEqual(backend.update_job(self.job["id"], args)[1]["reason"], "source_changed")
+        older = dict(args, pc_path=r"E:\docs", expected_pc_path=r"D:\docs", selection_seq=2)
+        self.assertEqual(backend.update_job(self.job["id"], older)[0], 409)
+        args["expected_pc_path"] = r"D:\docs"
+        self.assertEqual(backend.update_job(self.job["id"], args)[0], 200)
+        self.assertEqual(backend.load_jobs()[self.job["id"]]["pc_path"], r"F:\docs")
+
     def test_successfully_read_empty_source_marks_last_file_deleted(self):
         path = self.seed("last.txt")
         plan = self.scan([])
