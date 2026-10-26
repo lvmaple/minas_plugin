@@ -41,6 +41,9 @@ menu_background_replacements = 0
 toolbar_tooltip_replacements = 0
 locale_bootstrap_replacements = 0
 locale_save_replacements = 0
+contains_guard_replacements = 0
+clipboard_copy_replacements = 0
+task_files_fallback_replacements = 0
 
 
 def unwrap_utility_layer(css):
@@ -123,6 +126,71 @@ for path in files:
             locale_bootstrap_marker,
             "return o(),()=>{t=!1,n+=1,k.off(Fr.LocaleChanged,a),s?.()}",
         )
+        # The NAS host portals Motrix windows into its own document. DOM nodes
+        # then come from a different realm than the script, so
+        # ancestor.contains(node) throws "parameter 1 is not of type 'Node'"
+        # (breaks e.g. the download-history copy-link menu). Guard the walk.
+        contains_marker = (
+            "function sS(e,t){let n=e.parentElement;"
+            "for(;n&&!n.contains(t);)n=n.parentElement;return n}"
+        )
+        contains_guard = (
+            "function sS(e,t){if(!(t instanceof Node))return null;"
+            "let n=e.parentElement;for(;n;){try{if(n.contains(t))return n}"
+            "catch(r){return null}n=n.parentElement}return null}"
+        )
+        contains_guard_replacements += content.count(contains_marker)
+        content = content.replace(contains_marker, contains_guard)
+        # The NAS WebView/micro-app blocks navigator.clipboard.writeText
+        # (Permissions-Policy / sandbox), so copy-link and copy-path die with
+        # copyUrlFailed. Route every write through a helper that falls back to
+        # a hidden textarea + document.execCommand('copy').
+        clipboard_marker = "navigator.clipboard.writeText"
+        clipboard_helper = (
+            "globalThis.__motrixCopyText=async t=>{"
+            "try{const c=navigator.clipboard;if(c&&c.writeText){await c.writeText(t);return}}"
+            "catch(e){}"
+            "const a=document.createElement('textarea');a.value=t;"
+            "a.setAttribute('readonly','');"
+            "a.style.cssText='position:fixed;left:-9999px;top:0';"
+            "document.body.appendChild(a);a.focus();a.select();"
+            "a.setSelectionRange(0,a.value.length);"
+            "try{document.execCommand('copy')}"
+            "finally{a.remove()}}"
+        )
+        if clipboard_marker in content:
+            clipboard_copy_replacements += content.count(clipboard_marker)
+            if "__motrixCopyText" not in content:
+                content = clipboard_helper + ";" + content
+            content = content.replace(clipboard_marker, "globalThis.__motrixCopyText")
+        # Completed HTTP tasks drop out of aria2's file list after finish, so
+        # GetTaskFiles returns [] and the inspector file pane shows "0 files"
+        # even though finalPath still points at the downloaded blob. Synthesize
+        # one row from the task record when the engine list is empty.
+        task_files_marker = (
+            "{files:a}=GB(e.id,i),o=e.bt?.selectedFiles??[]"
+        )
+        # Show each file as the Files-app-relative NAS path (我的数据/...) so the
+        # inspector lists where the blob actually landed, not just basename.
+        task_files_fallback = (
+            "{files:_tf}=GB(e.id,i),"
+            "a=(_tf&&_tf.length?_tf:"
+            "(e.finalName||e.filename?"
+            "[{index:0,path:e.finalName||e.filename,"
+            "size:e.sizeWhenDone||e.totalBytes||0,selected:!0,"
+            "completedBytes:e.downloadedBytes||0}]:_tf||[]))"
+            ".map(f=>{"
+            "let p=String(f&&f.path||'').replace(/\\\\/g,'/');"
+            "let root=String(e.saveDir||'').replace(/\\\\/g,'/').replace(/\\/$/,'');"
+            "let abs=p.startsWith('/')?p:(root?root+'/'+p:p);"
+            "let m=abs.match(/\\/nas\\/pool0\\/u\\d+\\/data\\/(.+)$/);"
+            "let rel=m?m[1]:p.replace(/^\\//,'');"
+            "return Object.assign({},f,{path:'我的数据/'+rel});"
+            "}),"
+            "o=e.bt?.selectedFiles??[]"
+        )
+        task_files_fallback_replacements += content.count(task_files_marker)
+        content = content.replace(task_files_marker, task_files_fallback)
         # Applying the chosen language directly after a successful save also
         # works when the proxy does not deliver LocaleChanged over WebSocket.
         locale_save_marker = "await k.invoke(ft.UpdateSettings,{app:n}),n.theme!==void 0&&a(n.theme),t()"
@@ -183,6 +251,12 @@ if toolbar_tooltip_replacements != 2:
     raise SystemExit(f"Expected two toolbar tooltips, found {toolbar_tooltip_replacements}")
 if locale_bootstrap_replacements != 1:
     raise SystemExit(f"Expected one locale bootstrap hook, found {locale_bootstrap_replacements}")
+if contains_guard_replacements != 1:
+    raise SystemExit(f"Expected one sS contains walk, found {contains_guard_replacements}")
+if clipboard_copy_replacements != 5:
+    raise SystemExit(f"Expected five clipboard writeText calls, found {clipboard_copy_replacements}")
+if task_files_fallback_replacements != 1:
+    raise SystemExit(f"Expected one GetTaskFiles hook, found {task_files_fallback_replacements}")
 if locale_save_replacements != 1:
     raise SystemExit(f"Expected one locale save hook, found {locale_save_replacements}")
 
