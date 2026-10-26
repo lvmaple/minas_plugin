@@ -49,8 +49,21 @@ python .\deploy-plugins.py --select none                # 只验证连接不部�
 ## 部署内置的真机经验（自动处理，无需手动干预）
 
 1. **CRLF 分流**：打包时自动重写部署包——仅对 `.sh/.py/.cgi/.lua/.json/INFO/control` 等文本做 CRLF 修正，png/woff 等二进制原样保留（真机事故教训：`tr` 碰 PNG 会删掉 0x0D 字节导致图标损坏）
+   nc 执行的脚本文本也会在本地编码前统一为 LF，避免 Windows 换行导致 Bash 失败；base64 传输后的正文不再经过 `tr` 改写。
 2. **PATH 补全**：socat 通道执行时自动 `export PATH=$PATH:/usr/sbin:/sbin`（iptables 等工具在 /sbin，非交互 shell 找不到）
 3. **成功判定**：deploy 脚本输出各异（"部署完成"/"Motrix ready"等），失败时自动探测 `/home/u<uid>/plugin/<id>/INFO` 兜底确认，避免误报
+4. **HTTP 响应**：获取 WebDAV 凭据时使用 Python 标准库处理 Content-Length、连接关闭及单块/多块 chunked 响应，完整读取后再解析 JSON。HTTP 错误或传输截断不会缓存为成功结果，可以重新请求。
+5. **暂存目录权限**：上传前将部署暂存目录归属设为插件系统用户名 `u<uid>`，权限为 `755`，避免 root 创建的目录阻止 WebDAV 用户写入；米家数字 UID 不直接作为系统 UID 使用。
+
+## 本地回归
+
+```powershell
+python -X utf8 -m unittest discover -s tests -p 'test_deploy*.py' -v
+```
+
+`test_deploy_socat.py` 覆盖 Windows/POSIX 短、长脚本的 LF/CRLF 传输、正文保持、分块 HTTP 响应、失败重试和上传前权限设置。命令传输只在本机临时目录用 Bash 回放，HTTP 和目录准备使用本地替身，不连接 NAS；Windows 需 WSL，Linux 需 Bash。
+
+2026-10-26：新增 12 项回归在 Windows/WSL 通过，Linux/WSL 全部部署相关回归共 40 项通过。本次未执行 NAS 部署或真机任务验证。
 
 ## 部署后的插件自愈（重要前置）
 
