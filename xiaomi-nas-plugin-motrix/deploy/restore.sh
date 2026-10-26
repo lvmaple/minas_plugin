@@ -26,5 +26,20 @@ if [ -f "$BACKUP/ensure-egress.sh" ]; then
   /bin/sh "$BACKUP/ensure-egress.sh"
 fi
 if [ -f "$BACKUP/install-web-proxy.sh" ]; then
-  MOTRIX_SKIP_SERVICE_START=1 /bin/sh "$BACKUP/install-web-proxy.sh" "$UID_NUM"
+  NAS_IP="${2:-}"
+  if [ -z "$NAS_IP" ]; then
+    # systemd 只传 UID；本机默认路由出口地址即 WebDAV/客户端可达地址
+    NAS_IP="$(ip route get 1.1.1.1 2>/dev/null | sed -n 's/.* src \([0-9.]*\).*/\1/p' | head -n1)"
+  fi
+  if [ -z "$NAS_IP" ]; then
+    NAS_IP="$(hostname -I 2>/dev/null | awk '{for(i=1;i<=NF;i++) if($i ~ /^[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+$/ && $i !~ /^127\./) {print $i; exit}}')"
+  fi
+  if [ -z "$NAS_IP" ]; then
+    NAS_IP="$(ip -4 addr show scope global 2>/dev/null | awk '/inet / {sub(/\/.*/, "", $2); print $2; exit}')"
+  fi
+  if [ -z "$NAS_IP" ]; then
+    echo 'Motrix restore: cannot determine NAS IPv4 address; proxy restoration failed and can be retried' >&2
+    exit 1
+  fi
+  MOTRIX_SKIP_SERVICE_START=1 /bin/sh "$BACKUP/install-web-proxy.sh" "$UID_NUM" "$NAS_IP"
 fi
