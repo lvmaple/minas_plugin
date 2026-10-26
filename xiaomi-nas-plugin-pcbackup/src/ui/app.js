@@ -11,6 +11,13 @@
   var BRIDGE_MAX_FILE = 64 * 1024 * 1024;
   var RETRY_MAX = 3;
   var LOG_KEEP = 400;
+  var API_TIMEOUT_MS = 60000;
+  var NATIVE_IDLE_MS = 120000;
+  var NATIVE_TOTAL_MS = 6 * 60 * 60 * 1000;
+  var MKDIRS_BATCH_MAX = 2000;
+  var MKDIRS_CONCURRENCY = 2;
+  var UPLOAD_CONCURRENCY = 6;
+  var sourceSelectionSession = operationId();
   var DEFAULT_EXCLUDES = [
     "Thumbs.db", "desktop.ini", ".DS_Store", "~$*",
     "node_modules/", ".pnpm-store/", ".venv/", "venv/", ".gradle/",
@@ -31,7 +38,9 @@
     sourcePath: "",      // 原生读取的 PC 根目录；经典 FileList 模式为空
     resumeRunId: null,
     resumeInfo: null,
+    finishPending: null,
     isResuming: false,
+    browserResumeRequested: false,
     discardResumeOnRun: false,
     resumeNoticeShown: false,
     cancel: false,
@@ -71,22 +80,161 @@
     return base + "/" + ep;
   }
 
+  var _activeRequests = [];
+  function requestJson(url, opt, cancellable) {
+    return new Promise(function (resolve, reject) {
+      var controller = new AbortController(), done = false;
+      var timer;
+      function finish(fn, value) {
+        if (done) return;
+        done = true;
+        clearTimeout(timer);
+        var index = _activeRequests.indexOf(cancel);
+        if (index >= 0) _activeRequests.splice(index, 1);
+        fn(value);
+      }
+      function cancel() {
+        finish(reject, { cancelled: true });
+        controller.abort();
+      }
+      if (cancellable) {
+        if (state.cancel) { cancel(); return; }
+        _activeRequests.push(cancel);
+      }
+      opt.signal = controller.signal;
+      timer = setTimeout(function () {
+        finish(reject, new Error("服务端请求超时，请检查连接后继续备份"));
+        controller.abort();
+      }, API_TIMEOUT_MS);
+      Promise.resolve().then(function () { return fetch(url, opt); }).then(function (r) {
+        return r.json().then(function (j) {
+          if (!r.ok) {
+            var err = new Error(j.message || ("HTTP " + r.status));
+            err.status = r.status; err.code = j.code; err.data = j.data;
+            throw err;
+          }
+          return j;
+        }, function (e) {
+          // HTML gateway errors still carry an HTTP failure, rather than
+          // masquerading as a network loss that healthy admissions can reset.
+          if (!r.ok) e.status = r.status;
+          throw e;
+        });
+      }).then(function (j) { finish(resolve, j); }, function (e) { finish(reject, e); });
+    });
+  }
+
   function api(method, ep, body) {
     var opt = { method: method, cache: "no-store" };
     if (body !== undefined) {
       opt.headers = { "Content-Type": "application/json" };
       opt.body = JSON.stringify(body);
     }
-    return fetch(apiUrl(ep), opt).then(function (r) {
-      return r.json().catch(function () { return {}; }).then(function (j) {
-        if (!r.ok || (j.code !== undefined && j.code !== 0)) {
-          var err = new Error(j.message || ("HTTP " + r.status));
+    var cancellable = state.running && /\/(part|commit|mkdirs|prepare-paths|native-upload|deleted)(?:\?|$)/.test(ep);
+    return requestJson(apiUrl(ep), opt, cancellable).then(function (j) {
+        if (j.code !== undefined && j.code !== 0) {
+          var err = new Error(j.message || ("服务端错误 " + j.code));
           err.code = j.code; err.data = j.data;
           throw err;
         }
         return j.data;
-      });
     });
+  }
+
+  function operationId() {
+    var id = "";
+    for (var n = 0; n < 32; n++) id += Math.floor(Math.random() * 16).toString(16);
+    return id;
+  }
+
+  function waitSecond() {
+    return new Promise(function (resolve) { setTimeout(resolve, 1000); });
+  }
+
+  function finishAndWait(job, stats) {
+    // Retries keep exactly the same identity and stats, including elapsed time.
+    stats.async = true;
+    stats.request_id = stats.request_id || operationId();
+    var pending = { jobId: job.id, runId: stats.run_id, stats: stats };
+    state.finishPending = pending;
+    var base = "api/jobs/" + job.id, failures = 0, networkFailures = 0, cancelSent = false;
+    function request(submit) {
+      var promise, cancelling = state.cancel && !stats.cancelled && !cancelSent && !submit;
+      if (cancelling) {
+        promise = api("POST", base + "/finish-cancel", { request_id: stats.request_id })
+          .then(function (out) { cancelSent = true; return out; });
+      } else {
+        promise = submit ? api("POST", base + "/finish", stats)
+          : api("GET", base + "/finish-status?request_id=" + stats.request_id);
+      }
+      return promise.then(function (out) {
+        if (out && out.phase === "done") return out.result;
+        if (out && out.phase === "running") {
+          networkFailures = 0;
+          // An admission ACK cannot prove a failed verifier has recovered.
+          if (!submit && !cancelling) failures = 0;
+          return waitSecond().then(function () { return request(false); });
+        }
+        // Compatibility with a synchronous server's explicit final receipt.
+        if (out && out.status) return out;
+        throw new Error("收尾响应无效，请刷新后检查备份结果");
+      }, function (e) {
+        if (e.status && e.status < 500 && e.status !== 404) throw e;
+        if ((e.status ? ++failures : ++networkFailures) >= RETRY_MAX) throw e;
+        log("[收尾] 连接或确认失败，正在查询或重试：" + e.message, "lg-err");
+        return waitSecond().then(function () { return request(submit || !!e.status); });
+      });
+    }
+    return request(true).then(function (entry) {
+      if (!entry || ["ok", "partial", "cancelled"].indexOf(entry.status) < 0) {
+        throw new Error("服务端尚未确认备份结果，请刷新后检查");
+      }
+      if (state.finishPending === pending) state.finishPending = null;
+      return entry;
+    });
+  }
+
+  function readResume(job) {
+    var id = job.resume_check_pending || operationId(), failures = 0, networkFailures = 0;
+    var finishId = job.finish_pending, finishResult = null, retryFinish = false, admission = true;
+    function poll() {
+      if (state.job !== job) return Promise.resolve(null);
+      var ep = "api/jobs/" + job.id + (finishId ? "/finish-status?request_id=" + finishId
+        : "/resume?async=1&request_id=" + id);
+      var admitting = admission || retryFinish;
+      var request = finishId && retryFinish
+        ? api("POST", "api/jobs/" + job.id + "/finish-retry", { request_id: finishId })
+        : api("GET", ep);
+      return request.then(function (out) {
+        retryFinish = false;
+        networkFailures = 0;
+        if (!admitting) failures = 0;
+        admission = false;
+        if (finishId) {
+          if (out.phase === "running") return waitSecond().then(poll);
+          finishId = null;
+          finishResult = out.result;
+          if (!finishResult || ["ok", "partial", "cancelled"].indexOf(finishResult.status) < 0) {
+            throw new Error("服务端尚未确认上次备份结果");
+          }
+          if (finishResult.status === "ok") return { finish_result: finishResult };
+          failures = 0; // A subsequent resume check is a separate operation.
+          admission = true;
+          return poll();
+        }
+        id = out.request_id;
+        if (out.phase === "done") return out.result || (finishResult ? { finish_result: finishResult } : null);
+        if (out.phase !== "running") throw new Error("续传校验响应无效");
+        return waitSecond().then(poll);
+      }, function (e) {
+        if (e.status && e.status < 500) throw e;
+        if ((e.status ? ++failures : ++networkFailures) >= RETRY_MAX) throw e;
+        retryFinish = !!finishId && !!e.status;
+        admission = !!e.status;
+        return waitSecond().then(poll);
+      });
+    }
+    return poll();
   }
 
   function toast(msg, isErr) {
@@ -180,15 +328,17 @@
           '<p class="meta muted ellipsis" title="' + esc(j.destination) + '">📁 ' + esc(destLabel(j)) + "</p>" +
           '<div class="job-stats">' +
             (j.resume_available ? '<span class="pill warn">上次备份未完成</span>' : '') +
-            '<span class="pill ok">' + j.files + " 个文件</span>" +
-            '<span class="pill">' + fmtBytes(j.bytes) + "</span>" +
+            (j.summary_pending || j.finish_pending ? '<span class="pill warn">' +
+              (j.finish_pending ? '收尾校验中…' : (j.resume_check_pending ? '续传核对中…' : '统计读取中…')) + '</span>' :
+              '<span class="pill ok">' + j.files + ' 个文件</span><span class="pill">' + fmtBytes(j.bytes) + '</span>') +
             '<span class="pill warn">上次：' + (j.last_run ? fmtTime(j.last_run) : "从未") + "</span>" +
           "</div>" +
           '<p class="meta muted">上次结果：上传 ' + (last.uploaded || 0) + " · 跳过 " + (last.skipped || 0) +
             " · 标记删除 " + (last.deleted || 0) + "</p>" +
           '<div class="job-actions">' +
             '<button class="btn primary" data-act="backup" data-id="' + j.id + '">' +
-              (j.resume_available ? '继续备份' : '开始备份') + '</button>' +
+              (j.finish_pending ? '查看收尾进度' : (j.resume_check_pending ? '查看续传进度' :
+                (j.resume_available ? '继续备份' : '开始备份'))) + '</button>' +
             '<button class="btn" data-act="files" data-id="' + j.id + '">文件</button>' +
             '<button class="btn" data-act="history" data-id="' + j.id + '">历史</button>' +
             '<button class="btn" data-act="edit" data-id="' + j.id + '">编辑</button>' +
@@ -274,10 +424,14 @@
   /* ── 备份流程 ──────────────────────────── */
 
   function openBackup(job) {
+    state.scanToken = (state.scanToken || 0) + 1;
+    state.pickToken = (state.pickToken || 0) + 1;
+    var token = state.pickToken;
     state.job = job;
     state.entries = null; state.plan = null; state.folder = "";
     state.sourcePath = ""; state.resumeRunId = null;
     state.resumeInfo = null; state.isResuming = false;
+    state.browserResumeRequested = false;
     state.discardResumeOnRun = false;
     $("bkJobName").textContent = job.name;
     $("bkJobDest").textContent = "📁 " + destLabel(job);
@@ -297,25 +451,41 @@
     if (job.resume_available) {
       $("stepPick").hidden = true;
       $("stepResume").hidden = false;
-      $("resumeSummary").textContent = "正在读取上次备份进度…";
-      api("GET", "api/jobs/" + job.id + "/resume").then(function (info) {
-        if (state.job !== job) return;
+      $("btnResumeFresh").disabled = !!job.finish_pending;
+      $("btnResume").disabled = true;
+      $("resumeSummary").textContent = job.finish_pending ? "收尾校验中，请等待服务端确认结果…" : "正在读取上次备份进度…";
+      readResume(job).then(function (info) {
+        if (state.job !== job || state.pickToken !== token) return;
+        $("btnResumeFresh").disabled = false;
+        if (info && info.finish_result) {
+          $("resumeSummary").textContent = info.finish_result.status === "ok"
+            ? "上次备份已完成，服务端已确认成功。可在历史记录中查看结果。"
+            : "上次备份" + (info.finish_result.status === "cancelled" ? "已取消" : "部分失败") + "，请重新选择源目录后继续。";
+          loadJobs();
+          return;
+        }
         if (!info || !info.run_id) { $("stepResume").hidden = true; $("stepPick").hidden = false; return; }
         state.resumeInfo = info;
         $("resumeSummary").textContent = "已完成 " + info.plan.previous_uploaded +
           " 个文件，待上传 " + info.files.length + " 个，待处理删除 " +
           info.plan.deleted.length + " 个；可从 NAS 上的未完成分块继续。";
         $("resumePath").textContent = "PC 目录：" + info.source_path;
-        $("btnResume").disabled = !getBridge();
+        var browser = info.source_kind === "browser";
+        $("btnResume").disabled = !browser && !getBridge();
+        $("btnResume").textContent = browser ? "选择原目录继续" : "继续备份";
+        if (browser) $("resumePath").textContent = "请重新选择原来的「" + info.plan.folder + "」目录";
         var warning = (info.del_mode === "delete" && info.plan.deleted.length)
           ? "上次选择了直接删除 PC 上已删除的文件。" : "";
         if (info.prune_excluded) warning += "上次选择了清理排除文件。";
-        $("resumeHint").textContent = getBridge()
+        $("resumeHint").textContent = browser
+          ? warning + "重新选择原目录并核对待传文件后，从已保存的分块继续。"
+          : getBridge()
           ? warning + "继续时只处理上次计划；期间新增或删除的文件需下次重新扫描。"
           : "请在小米桌面 App 中打开插件，才能按保存的 PC 路径继续。";
       }).catch(function (e) {
-        if (state.job !== job) return;
-        state.discardResumeOnRun = true;
+        if (state.job !== job || state.pickToken !== token) return;
+        state.discardResumeOnRun = e.status === 409;
+        $("btnResumeFresh").disabled = false;
         $("stepResume").hidden = true; $("stepPick").hidden = false;
         toast("读取续传记录失败：" + e.message, true);
       });
@@ -324,7 +494,17 @@
 
   function resumeBackup() {
     var info = state.resumeInfo;
-    if (!info || !getBridge() || state.running) return;
+    if (!info || state.running) return;
+    if (info.source_kind === "browser") {
+      state.sourcePath = "";
+      if (!info.files.length) { state.fileMap = {}; applyResumePlan(info); return; }
+      state.browserResumeRequested = true;
+      $("stepResume").hidden = true;
+      $("stepPick").hidden = false;
+      $("dirInput").click();
+      return;
+    }
+    if (!getBridge()) return;
     state.sourcePath = info.source_path;
     state.resumeRunId = info.run_id;
     state.isResuming = true;
@@ -337,6 +517,12 @@
         size: item[1], mtime: item[2]
       };
     });
+    applyResumePlan(info);
+  }
+
+  function applyResumePlan(info) {
+    state.resumeRunId = info.run_id;
+    state.isResuming = true;
     state.plan = info.plan;
     $("stepResume").hidden = true;
     renderPlan(info.plan);
@@ -368,16 +554,75 @@
 
   // -- 选择目录 --
 
+  function beginPick() {
+    if (state.running) { toast("正在传输，先取消再重新选目录", true); return null; }
+    if (state.resumeRunId && state.resumeInfo && state.resumeInfo.source_kind === "browser" && !state.discardResumeOnRun) {
+      state.browserResumeRequested = true;
+    }
+    state.pickToken = (state.pickToken || 0) + 1;
+    state.scanToken = (state.scanToken || 0) + 1;
+    state.plan = null;
+    state.resumeRunId = null;
+    state.isResuming = false;
+    $("stepPlan").hidden = true;
+    return { job: state.job, token: state.pickToken };
+  }
+
+  function currentPick(pick) {
+    return pick && state.job === pick.job && state.pickToken === pick.token && !state.running;
+  }
+
+  function resumeBrowserSelection(pick) {
+    var info = state.resumeInfo;
+    if (info.needsRefresh) {
+      setPickStatus("正在核对上次备份进度…");
+      var pending = state.finishPending;
+      var settled = pending && pending.jobId === pick.job.id && pending.runId === info.run_id
+        ? finishAndWait(pick.job, pending.stats) : Promise.resolve();
+      return settled.then(function () {
+        if (!currentPick(pick)) return null;
+        return readResume(pick.job);
+      }).then(function (fresh) {
+        if (!currentPick(pick)) return;
+        if (!fresh || !fresh.run_id) {
+          state.resumeInfo = null;
+          state.browserResumeRequested = false;
+          state.isResuming = false;
+          state.discardResumeOnRun = false;
+          return doScan(false, false);
+        }
+        state.resumeInfo = fresh;
+        resumeBrowserSelection(pick);
+      }).catch(function (e) { if (currentPick(pick)) { setPickStatus(null); toast(e.message, true); } });
+    }
+    var matches = info.plan.folder === state.folder && info.files.every(function (item) {
+      var entry = state.fileMap[item[0]];
+      return entry && entry.size === item[1] && Math.abs(entry.mtime - item[2]) <= 1;
+    });
+    if (matches) {
+      state.browserResumeRequested = false;
+      applyResumePlan(info);
+      return;
+    }
+    ask("目录或文件已变化", "所选目录与上次未完成计划不一致，是否重新扫描？旧备份和未完成分块会保留。").then(function (yes) {
+      if (!currentPick(pick)) return;
+      if (yes) {
+        state.resumeInfo = null;
+        state.browserResumeRequested = false;
+        state.discardResumeOnRun = true;
+        doScan(false, false);
+      } else {
+        $("stepResume").hidden = false;
+        $("stepPick").hidden = true;
+      }
+    });
+  }
+
   // 大目录逐文件过滤必须分块让出主线程，否则 UI 冻死
   // 选择结果收口（经典 FileList 与原生读取共用）
   // 条目统一形状：{rel, file?|abs?, size, mtime}
-  function finishPick(entries, folderName, sourceLabel, excludedCount) {
-    if (state.running) { toast("正在传输中，等完成或取消后再重新选择", true); return; }
-    if (!entries.length) {
-      setPickStatus(null);
-      toast("该目录下没有可备份的文件（可能全被排除规则过滤了）", true);
-      return;
-    }
+  function finishPick(entries, folderName, sourceLabel, excludedCount, pick) {
+    if (!currentPick(pick)) return;
     entries.sort(function (a, b) { return a.rel < b.rel ? -1 : 1; });
     state.entries = entries;
     state.folder = folderName || "目录";
@@ -392,10 +637,16 @@
     $("pickInfo").hidden = false;
     $("pickCount").textContent = entries.length + " 个文件";
     resetSteps();
+    if (state.browserResumeRequested && state.resumeInfo) {
+      resumeBrowserSelection(pick);
+      return;
+    }
     doScan(false, false);
   }
 
-  function onPicked(files, folderName) {
+  function onPicked(files, folderName, pick) {
+    pick = pick || beginPick();
+    if (!currentPick(pick)) return;
     state.sourcePath = "";
     var job = state.job;
     var n = files.length;
@@ -405,6 +656,7 @@
     var CHUNK = 3000;
 
     function step() {
+      if (!currentPick(pick)) return;
       var end = Math.min(idx + CHUNK, n);
       for (; idx < end; idx++) {
         var f = files[idx];
@@ -421,7 +673,7 @@
         setTimeout(step, 0);
         return;
       }
-      finishPick(entries, folderName, "", n - entries.length);
+      finishPick(entries, folderName, "", n - entries.length, pick);
     }
 
     setPickStatus("正在筛选文件…");
@@ -466,22 +718,33 @@
   // -- 增量比对 --
 
   function doScan(confirm, force) {
+    if (state.running) return;
     var job = state.job;
     var meta = state.entries.map(function (e) {
       return { p: e.rel, s: e.size, m: e.mtime };
     });
     $("stepPlan").hidden = true;
     state.scanToken = (state.scanToken || 0) + 1;
+    var token = state.scanToken;
+    function current() { return state.job === job && state.scanToken === token && !state.running; }
     setPickStatus("正在发送文件清单（" + meta.length + " 个文件）…");
     api("POST", "api/jobs/" + job.id + "/scan",
         { folder: state.folder, files: meta, confirm: !!confirm, force: !!force,
           replace_resume: state.discardResumeOnRun })
-      .then(function () { pollScan(job.id, state.scanToken); })
+      .then(function () { if (current()) pollScan(job.id, token); })
       .catch(function (e) {
+        if (!current()) return;
         setPickStatus(null);
         if (e.data && e.data.reason === "folder_mismatch") {
           ask("切换备份目录？", e.data.message).then(function (yes) {
-            if (yes) doScan(true, force);
+            if (yes && current()) doScan(true, force);
+          });
+        } else if (e.data && e.data.reason === "resume_corrupt") {
+          ask("重新扫描备份目录？", e.data.message || e.message).then(function (yes) {
+            if (yes && current()) {
+              state.discardResumeOnRun = true;
+              doScan(confirm, force);
+            }
           });
         } else if (e.data && e.data.reason === "deleted_ratio") {
           state.plan = null;
@@ -502,7 +765,7 @@
             $("btnRun").disabled = !$("chkForce").checked;
           };
           $("btnRun").onclick = function () {
-            if ($("chkForce").checked) doScan(confirm, true);
+            if ($("chkForce").checked && current()) doScan(confirm, true);
           };
         } else {
           toast(e.message || "比对失败", true);
@@ -512,9 +775,10 @@
 
   // 轮询异步比对进度（大目录几十秒，必须让用户看到它在动）
   function pollScan(jid, token) {
-    if (token !== state.scanToken) return;   // 已重选目录/重开流程，停止旧轮询
+    function current() { return token === state.scanToken && state.job && state.job.id === jid && !state.running; }
+    if (!current()) return;
     api("GET", "api/jobs/" + jid + "/scan-status").then(function (s) {
-      if (token !== state.scanToken) return;
+      if (!current()) return;
       if (s.phase === "done") {
         state.plan = s.plan;
         renderPlan(s.plan);
@@ -534,7 +798,7 @@
       setPickStatus(txt);
       setTimeout(function () { pollScan(jid, token); }, 800);
     }).catch(function (e) {
-      if (token !== state.scanToken) return;
+      if (!current()) return;
       setPickStatus(null);
       toast(e.message || "获取比对进度失败", true);
     });
@@ -593,23 +857,53 @@
 
   // -- 上传执行 --
 
+  // 活跃 XHR 登记：取消时统一 abort，杜绝僵尸 PUT 在取消/失败后仍打服务端（曾把
+  // 服务端 .part 截断引发 409 连锁）
+  var _activeXhrs = [];
+  function abortAllUploads() {
+    var xhrs = _activeXhrs.slice();
+    _activeXhrs = [];
+    xhrs.forEach(function (x) { try { x.abort(); } catch (e) {} });
+    _activeRequests.slice().forEach(function (cancel) { cancel(); });
+    Object.keys(_nativeTransfers).forEach(function (tag) {
+      _nativeTransfers[tag].stop({ cancelled: true });
+    });
+  }
+
   function xhrPut(url, blob, onProgress) {
     return new Promise(function (resolve, reject) {
       var xhr = new XMLHttpRequest();
+      _activeXhrs.push(xhr);
+      var settled = false;
+      function settle(fn, arg) {
+        if (settled) return;
+        settled = true;
+        var ix = _activeXhrs.indexOf(xhr);
+        if (ix >= 0) _activeXhrs.splice(ix, 1);
+        fn(arg);
+      }
       xhr.open("PUT", apiUrl(url));
-      xhr.timeout = 0;
-      xhr.upload.onprogress = function (ev) { if (onProgress) onProgress(ev.loaded); };
+      xhr.timeout = 5 * 60 * 1000;
+      var lastLoaded = 0;
+      xhr.upload.onprogress = function (ev) {
+        var delta = Math.max(0, ev.loaded - lastLoaded);
+        lastLoaded = Math.max(lastLoaded, ev.loaded);
+        if (onProgress) onProgress(delta);
+      };
       xhr.onload = function () {
-        if (xhr.status >= 200 && xhr.status < 300) resolve();
+        if (xhr.status >= 200 && xhr.status < 300) settle(resolve);
         else {
           var msg = "HTTP " + xhr.status;
-          try { msg = JSON.parse(xhr.responseText).message || msg; } catch (e) {}
+          var response;
+          try { response = JSON.parse(xhr.responseText); msg = response.message || msg; } catch (e) {}
           var err = new Error(msg); err.status = xhr.status; err.resp = xhr.responseText;
-          reject(err);
+          err.data = response && response.data;
+          settle(reject, err);
         }
       };
-      xhr.onerror = function () { reject(new Error("网络错误")); };
-      xhr.ontimeout = function () { reject(new Error("上传超时")); };
+      xhr.onerror = function () { settle(reject, new Error("网络错误")); };
+      xhr.ontimeout = function () { settle(reject, new Error("上传超时")); };
+      xhr.onabort = function () { settle(reject, { cancelled: true }); };
       xhr.send(blob);
     });
   }
@@ -617,11 +911,25 @@
   function withRetry(fn, label) {
     var attempt = 0;
     function tryOnce() {
+      if (state.cancel) return Promise.reject({ cancelled: true });
       return fn().catch(function (e) {
         attempt++;
+        // 409=offset_mismatch / 400=参数错：状态冲突重试无意义，直接抛
+        if (e && (e.cancelled || e.status === 409 || e.status === 400)) throw e;
         if (state.cancel || attempt >= RETRY_MAX) throw e;
         log("第 " + attempt + " 次重试 " + label + "：" + e.message, "lg-err");
-        return new Promise(function (r) { setTimeout(r, 1000 * Math.pow(2, attempt)); }).then(tryOnce);
+        return new Promise(function (resolve, reject) {
+          var timer;
+          function clear() {
+            clearTimeout(timer);
+            var index = _activeRequests.indexOf(cancel);
+            if (index >= 0) _activeRequests.splice(index, 1);
+          }
+          function cancel() { clear(); reject({ cancelled: true }); }
+          if (state.cancel) { cancel(); return; }
+          _activeRequests.push(cancel);
+          timer = setTimeout(function () { clear(); resolve(); }, 1000 * Math.pow(2, attempt));
+        }).then(tryOnce);
       });
     }
     return tryOnce();
@@ -638,31 +946,70 @@
     logBox.scrollTop = logBox.scrollHeight;
   }
 
+  function prepareNativeDirectories(job, uploads, progress, generation) {
+    generation = generation || (state.plan && state.plan.generation);
+    var index = 0, processed = 0, made = 0, completed = 0, failure = null;
+    var batches = Math.ceil(uploads.length / MKDIRS_BATCH_MAX);
+    function worker() {
+      if (state.cancel) failure = failure || { cancelled: true };
+      if (failure || index >= uploads.length) return Promise.resolve();
+      var start = index;
+      var paths = uploads.slice(start, start + MKDIRS_BATCH_MAX).map(function (item) { return item[0]; });
+      index += paths.length;
+      var batch = Math.floor(start / MKDIRS_BATCH_MAX) + 1;
+      return api("POST", "api/jobs/" + job.id + "/mkdirs",
+        { paths: paths, generation: generation }).then(function (result) {
+        if (state.cancel) throw { cancelled: true };
+        if (!result || result.processed !== paths.length) {
+          throw new Error("目录准备未覆盖全部文件，请更新插件后重试");
+        }
+        made += result.created || 0;
+        processed += paths.length;
+        completed++;
+        if (progress) progress(processed, uploads.length, { batch: batch, completed: completed, batches: batches });
+      }).catch(function (e) {
+        failure = failure || e || new Error("目录准备失败");
+        if (!(e && e.cancelled)) {
+          log("[准备目录] 批次 " + batch + " / " + batches + " 失败：" + (e.message || e) +
+            "；停止派发新批次，等待已发出的请求结束", "lg-err");
+        }
+      }).then(worker);
+    }
+    var workers = [];
+    for (var w = 0; w < MKDIRS_CONCURRENCY; w++) workers.push(worker());
+    // Drain every in-flight batch before reporting failure or starting uploads.
+    return Promise.all(workers).then(function () {
+      if (state.cancel) throw { cancelled: true };
+      if (failure) throw failure;
+      return { created: made };
+    });
+  }
+
   function runUpload() {
     if (state.running || !state.plan) return;
     if (state.sourcePath && !getPcFs()) {
       var bridge = getBridge();
-      if (!bridge || typeof bridge.getPcFileStream !== "function") {
-        toast("桌面端无法读取 PC 文件，请点「选择文件夹」重新扫描", true);
-        return;
-      }
-      if (state.plan.upload.some(function (item) { return item[1] > BRIDGE_MAX_FILE; })) {
-        toast("原生桥接无法安全读取大文件，请点「选择文件夹」重新扫描", true);
+      if (!bridge || typeof bridge.upLoadToNas !== "function") {
+        toast("桌面端缺少原生上传接口，请点「选择文件夹」用浏览器模式", true);
         return;
       }
     }
-    if (state.sourcePath && !state.resumeRunId) {
+    if (!state.resumeRunId) {
       state.running = true;
       $("btnRun").disabled = true;
       var selectedMode = document.querySelector('input[name="delMode"]:checked');
       api("POST", "api/jobs/" + state.job.id + "/resume", {
         scan_id: state.plan.scan_id,
+        generation: state.plan.generation,
         source_path: state.sourcePath,
+        source_kind: state.sourcePath ? "native" : "browser",
         del_mode: selectedMode ? selectedMode.value : "del",
         prune_excluded: $("chkPruneExcluded").checked,
         replace: state.discardResumeOnRun
       }).then(function (info) {
         state.resumeRunId = info.run_id;
+        info.source_kind = info.source_kind || (state.sourcePath ? "native" : "browser");
+        state.resumeInfo = info;
         state.discardResumeOnRun = false;
         state.running = false;
         runUploadActive();
@@ -679,6 +1026,11 @@
   function runUploadActive() {
     if (state.running || !state.plan) return;
     var job = state.job, plan = state.plan;
+    var generation = plan.generation;
+    if (!/^[0-9a-f]{32}$/.test(generation || "")) {
+      toast("备份计划缺少运行标识，请刷新后继续备份或重新扫描", true);
+      return;
+    }
     var delModeEl = document.querySelector('input[name="delMode"]:checked');
     var delMode = delModeEl ? delModeEl.value : "del";       // del=改名保留 / delete=直接删除
     var applyDel = plan.deleted.length > 0 && delMode;
@@ -692,6 +1044,7 @@
     $("stepRun").scrollIntoView({ behavior: "smooth", block: "nearest" });
     logBox = $("runLog");
     logBox.innerHTML = "";
+    log("[任务] " + (job.name || job.id), "lg-skip");
 
     var t0 = Date.now();
     var doneBytes = plan.previous_bytes || 0;
@@ -699,18 +1052,28 @@
     var totalBytes = (plan.upload_bytes || 0) + doneBytes || 1;
     var totalCount = plan.upload.length + okCount;
     var failed = [], delCount = plan.previous_deleted || 0;
+    var planError = null;
     var speed = { last: t0, bytes: 0, val: 0 };
+    var paintTimer = null, lastPaint = -1000, pendingPhase = "", pendingFile;
 
-    function setProgress(phase, curFile) {
+    function paintProgress() {
+      clearTimeout(paintTimer); paintTimer = null; lastPaint = Date.now();
       var pct = Math.min(100, doneBytes * 100 / totalBytes);
       $("runBar").style.width = pct.toFixed(1) + "%";
-      var elapsed = (Date.now() - t0) / 1000;
-      $("runPhase").textContent = phase;
+      $("runPhase").textContent = pendingPhase;
       $("runStats").textContent =
         okCount + " / " + totalCount + " 个文件 · " + fmtBytes(doneBytes) + " / " + fmtBytes(totalBytes) +
         " · " + (speed.val ? fmtBytes(speed.val) + "/s" : "…") +
         (speed.val > 0 ? " · 剩余约 " + Math.max(1, Math.round((totalBytes - doneBytes) / speed.val)) + " 秒" : "");
-      if (curFile !== undefined) $("runFile").textContent = curFile || "";
+      if (pendingFile !== undefined) $("runFile").textContent = pendingFile || "";
+    }
+    function setProgress(phase, curFile, force) {
+      var changed = phase !== pendingPhase;
+      pendingPhase = phase;
+      if (curFile !== undefined) pendingFile = curFile;
+      if (changed) log("[阶段] " + phase, phase === "异常中断" ? "lg-err" : "lg-skip");
+      if (force || changed || Date.now() - lastPaint >= 200) paintProgress();
+      else if (paintTimer === null) paintTimer = setTimeout(paintProgress, 200);
     }
     setProgress("准备…", "");
 
@@ -728,19 +1091,26 @@
       var rel = item[0];
       var ent = state.fileMap[rel];
       var size = ent.size, mtime = ent.mtime;
-      var url = "api/jobs/" + job.id + "/data?path=" + encodeURIComponent(rel) + "&offset=";
-      var checkSource = state.isResuming
-        ? nativeStat(getBridge(), ent.abs).then(function (st) {
+      var isNative = state.sourcePath && !ent.file && !getPcFs();
+      var nativeCommitted = false;
+      var url = "api/jobs/" + job.id + "/data?path=" + encodeURIComponent(rel) +
+        "&generation=" + encodeURIComponent(generation) + "&offset=";
+      var checkSource = ((state.isResuming && state.sourcePath && !isNative) || (isNative && size === 0))
+        ? nativeStat(getBridge(), ent.abs, true).then(function (st) {
             if (st.size !== size || Math.abs(Math.floor(st.mtimeMs) - mtime) > 1) {
               throw new Error("PC 文件已变化，请重新扫描目录");
             }
           })
         : Promise.resolve();
       return checkSource.then(function () {
-        if (state.sourcePath && !state.isResuming) return 0; // 新计划不接旧计划的 .part
-        return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel))
+        if (isNative || (state.sourcePath && !state.isResuming)) return 0;
+        return api("GET", "api/jobs/" + job.id + "/part?path=" + encodeURIComponent(rel) +
+          "&generation=" + encodeURIComponent(generation))
           .then(function (d) { return (d && d.size && d.size <= size) ? d.size : 0; })
-          .catch(function () { return 0; });
+          .catch(function (e) {
+            if (e && e.data && e.data.reason === "transfer_stale") throw e;
+            return 0;
+          });
       })
         .then(function (offset) {
           if (offset > 0) log("续传 @" + fmtBytes(offset) + " " + rel, "lg-skip");
@@ -751,17 +1121,50 @@
               return xhrPut(url + 0, new Blob([]), null);
             }, rel);
           }
+          // Native data stays in an isolated staging file until NAS reconciliation.
+          // Never fall back to the shared, unbounded getPcFileStream channel.
+          if (isNative) {
+            log("原生直传 " + fmtBytes(size) + " " + rel, "lg-skip");
+            var speedProbe = (function () {
+              var lastSeen = offset || 0;   // 直传回调给累计值，差分后才可进速度统计
+              return {
+                tick: function (p) {
+                  if (p && typeof p.transferred === "number") {
+                    var delta = Math.max(0, p.transferred - lastSeen);
+                    lastSeen = p.transferred;
+                    tickSpeed(delta);
+                    setProgress("上传中", rel + "（" + fmtBytes(p.transferred) + "）");
+                  }
+                },
+                // 主进程进度 IPC 有 1 秒节流：小文件几百毫秒传完，可能一个进度事件都
+                // 没发就 finish——速度永远显示"…"。完成时补记未上报的尾部字节。
+                settle: function () {
+                  var rest = Math.max(0, size - lastSeen);
+                  if (rest > 0) tickSpeed(rest);
+                }
+              };
+            })();
+            return uploadViaNative(job, ent, rel, size, mtime, offset,
+              function (p) { speedProbe.tick(p); }, generation)
+              .then(function () {
+                nativeCommitted = true;
+                speedProbe.settle();
+                doneBytes += size - offset;
+                setProgress("上传中", rel);
+              });
+          }
+          // 无原生桥（纯浏览器模式）：File 对象切片直读，不经 getPcFileStream
           function chunkLoop(off) {
             if (state.cancel) return Promise.reject({ cancelled: true });
             if (off >= size) return Promise.resolve();
             var end = Math.min(off + CHUNK_SIZE, size);
             var base = off;
-            return readEntryChunk(ent, base, end).then(function (blob) {
+            return Promise.resolve(readEntryChunk(ent, base, end)).then(function (blob) {
               if (blob.size !== end - base) throw new Error("读取的文件分块长度不符，请重新扫描目录");
               return withRetry(function () {
                 return xhrPut(url + base, blob, function (loaded) {
                   tickSpeed(loaded);
-                  setProgress("上传中", rel + "（" + fmtBytes(blob.size) + "）");
+                  setProgress("上传中", rel + "（" + fmtBytes(loaded) + "）");
                 });
               }, rel);
             }).then(function () {
@@ -773,8 +1176,11 @@
           return chunkLoop(offset);
         })
         .then(function () {
-          return api("POST", "api/jobs/" + job.id + "/commit",
-                     { p: rel, s: size, m: mtime });
+          if (nativeCommitted) return;
+          return withRetry(function () {
+            return api("POST", "api/jobs/" + job.id + "/commit",
+              { p: rel, s: size, m: mtime, generation: generation });
+          }, "确认文件 " + rel);
         })
         .then(function () {
           okCount++;
@@ -788,7 +1194,8 @@
         if (state.cancel || !paths.length) return Promise.resolve();
         var cur = paths.splice(0, 200);
         return withRetry(function () {
-          return api("POST", "api/jobs/" + job.id + "/deleted", { paths: cur, mode: delMode });
+          return api("POST", "api/jobs/" + job.id + "/deleted",
+            { paths: cur, mode: delMode, generation: generation });
         }, "处理删除").then(function (res) {
           (res || []).forEach(function (r) {
             if (r.status === "renamed") { delCount++; log("⟲ " + r.p + " → .del", "lg-del"); }
@@ -807,45 +1214,95 @@
         return tombstoneAll();
       });
     }
+    if (Object.keys(plan.type_archives || {}).length) {
+      chain = chain.then(function () {
+        setProgress("整理目标目录…", "保留同名旧目录，再继续上传");
+        return withRetry(function () {
+          return api("POST", "api/jobs/" + job.id + "/prepare-paths",
+            { run_id: state.resumeRunId, generation: generation });
+        }, "保留旧目录");
+      });
+    }
+    // Prepare every acknowledged batch before starting native workers.
+    if (state.sourcePath && !getPcFs() && plan.upload.length) {
+      chain = chain.then(function () {
+        setProgress("准备目录…", "");
+        var batches = Math.ceil(plan.upload.length / MKDIRS_BATCH_MAX);
+        log("[准备目录] 共 " + batches + " 批，" + MKDIRS_CONCURRENCY + " 批并发；每批最多 " +
+          MKDIRS_BATCH_MAX + " 个文件路径", "lg-skip");
+        return prepareNativeDirectories(job, plan.upload, function (n, total, info) {
+          var text = "已完成 " + info.completed + " / " + info.batches + " 批；累计处理 " +
+            n + " / " + total + " 个文件路径";
+          setProgress("准备目录…", text);
+          log("[准备目录] 批次 " + info.batch + " / " + info.batches + " 完成；" + text, "lg-skip");
+        }, generation)
+          .then(function (r) {
+            log("[准备目录] 全部完成，新增 " + r.created + " 个目标父目录", "lg-ok");
+          });
+      });
+    }
     chain = chain.then(function () {
-      // 文件间并发（4 路，避开浏览器同域连接数上限），单文件内部仍按块串行
-      var CONCURRENCY = 4;
+      if (plan.upload.length) {
+        log("[上传] 待传 " + plan.upload.length + " 个文件，" + UPLOAD_CONCURRENCY + " 文件并发", "lg-skip");
+      }
       var queue = plan.upload.slice();
       function worker() {
-        if (state.cancel || !queue.length) return Promise.resolve();
+        if (state.cancel || planError || !queue.length) return Promise.resolve();
         var item = queue.shift();
         setProgress("上传中", item[0]);
         return uploadOne(item).catch(function (e) {
           if (e && e.cancelled) return;
+          if (e && e.data && e.data.reason === "transfer_stale") {
+            planError = e;
+            state.cancel = true;
+            abortAllUploads();
+            return;
+          }
           failed.push(item[0]);
           log("✗ " + item[0] + " — " + (e.message || e), "lg-err");
         }).then(worker);
       }
       var workers = [];
       // 不要用 queue.length 当循环条件：worker() 同步 shift 会让队列中途变短，
-      // 小批量（≤4 个文件）只能起 1~2 个 worker，退化成串行
-      for (var w = 0; w < CONCURRENCY; w++) workers.push(worker());
-      return Promise.all(workers);
+      // 固定启动槽位，避免小队列少启动 worker。
+      for (var w = 0; w < UPLOAD_CONCURRENCY; w++) workers.push(worker());
+      return Promise.all(workers).then(function () { if (planError) throw planError; });
     });
 
-    chain.then(function () {
+    chain.catch(function (e) {
+      if (e && e.cancelled) { state.cancel = true; return; }
+      throw e;
+    }).then(function () {
       var elapsed = Date.now() - t0;
-      setProgress(state.cancel ? "已取消" : "完成", "");
-      return api("POST", "api/jobs/" + job.id + "/finish", {
+      setProgress("收尾校验中…", "正在确认备份结果，请等待服务端校验完成", true);
+      return finishAndWait(job, {
         run_id: state.resumeRunId,
+        generation: generation,
         uploaded: okCount, uploaded_bytes: doneBytes, skipped: plan.skipped,
         adopted: plan.adopted || 0,
         deleted: delCount, failed: failed.length, elapsed_ms: elapsed,
         cancelled: state.cancel,
         prune_excluded: $("chkPruneExcluded").checked && (plan.excluded_kept || 0) > 0
       }).then(function (entry) {
+        if (!entry || ["ok", "partial", "cancelled"].indexOf(entry.status) < 0) {
+          throw new Error("服务端尚未确认备份结果，请刷新后检查");
+        }
         if (entry.status === "partial" && !failed.length) throw new Error("仍有未完成文件，可再次继续备份");
+        state.cancel = entry.status === "cancelled" || !!entry.cancelled;
+        if (entry.status === "ok") { state.resumeRunId = null; state.resumeInfo = null; }
+        else if (state.resumeInfo) state.resumeInfo.needsRefresh = true;
+        setProgress(state.cancel ? "已取消" : (failed.length ? "部分失败" : "完成"), "", true);
       });
     }).then(function () {
       state.running = false;
       renderDone(okCount, delCount, failed, plan, state.cancel, Date.now() - t0);
       loadJobs();
     }).catch(function (e) {
+      if (state.resumeInfo) state.resumeInfo.needsRefresh = true;
+      setProgress("异常中断", "", true);
+      log("[异常] " + (e && e.message || e), "lg-err");
+      clearTimeout(paintTimer);
+      $("btnCancel").disabled = true;
       state.running = false;
       toast("备份异常中断：" + (e && e.message || e), true);
     });
@@ -959,60 +1416,86 @@
   //   getPcFileStream(path, start, onData, onEnd, onError) → 从 start 流到 EOF
   // 所有调用按 invoke 语义防御：promise 可能先回 undefined、结果稍后走回调。
 
+  // 主应用把 electronAPI 塞进微前端 globalData 时经过结构化克隆，函数成员会被剥掉，
+  // 插件侧拿到的是只剩数据字段的空壳。旧版 getBridge 每次重新解析且 globalData 优先，
+  // 一旦 App 填充了 globalData，扫描时用的真 preload 对象就会被空壳顶替——
+  // 表现为「列目录能用、upLoadToNas 判大文件失败」的割裂。故：真对象优先 + 健全性校验 + 缓存命中结果。
+  function bridgeUsable(b) {
+    // getPcFileStream 不再是必需项（通道已废弃）；openFileDialog 用于目录选择
+    return !!(b && typeof b === "object" &&
+      typeof b.getPcFileList === "function" &&
+      typeof b.upLoadToNas === "function");
+  }
+
+  var _bridge = undefined;
   function getBridge() {
-    try {
-      var g = window.microApp ? window.microApp.getGlobalData() : null;
-      if (g && g.electronAPI) return g.electronAPI;
-    } catch (e) {}
+    if (_bridge !== undefined) return _bridge;
+    var candidates = [];
     try {
       var rw = window.__MICRO_APP_WINDOW__ && window.__MICRO_APP_WINDOW__.rawWindow;
       if (rw) {
         for (var k in rw) {
-          try { if (rw[k] && rw[k].electronAPI) return rw[k].electronAPI; } catch (e) {}
+          try { if (rw[k] && rw[k].electronAPI) candidates.push(rw[k].electronAPI); } catch (e) {}
         }
       }
     } catch (e) {}
+    try { if (window.electronAPI) candidates.push(window.electronAPI); } catch (e) {}
     try {
       for (var i = 0; i < window.frames.length; i++) {
-        if (window.frames[i] && window.frames[i].electronAPI) return window.frames[i].electronAPI;
+        try { if (window.frames[i] && window.frames[i].electronAPI) candidates.push(window.frames[i].electronAPI); } catch (e) {}
       }
     } catch (e) {}
-    try { if (window.electronAPI) return window.electronAPI; } catch (e) {}
-    return null;
+    try {
+      var g = window.microApp ? window.microApp.getGlobalData() : null;
+      if (g && g.electronAPI) candidates.push(g.electronAPI);
+    } catch (e) {}
+    for (var j = 0; j < candidates.length; j++) {
+      if (bridgeUsable(candidates[j])) return (_bridge = candidates[j]);
+    }
+    return null;   // 不缓存失败：桥可能稍后才被注入，下次调用再找
   }
 
   function nativeListDir(api, pcPath) {
     return new Promise(function (resolve, reject) {
       var done = false;
-      function ok(v) { if (!done) { done = true; resolve(v); } }
-      function bad(e) { if (!done) { done = true; reject(e instanceof Error ? e : new Error("目录读取失败")); } }
+      var timer = setTimeout(function () { bad(new Error("目录读取超时")); }, 600000);
+      function ok(v) { if (!done) { done = true; clearTimeout(timer); resolve(v); } }
+      function bad(e) { if (!done) { done = true; clearTimeout(timer); reject(e instanceof Error ? e : new Error("目录读取失败")); } }
       try {
         var r = api.getPcFileList({ pcPath: pcPath, tag: "lst_" + Date.now() },
           function () {}, ok, bad);
         if (r && typeof r.then === "function") {
-          r.then(function (v) { if (v !== undefined) ok(v); }).catch(function () {});
+          r.then(function (v) { if (v !== undefined) ok(v); }).catch(bad);
         }
       } catch (e) { bad(e); }
-      setTimeout(function () { if (!done) bad(new Error("目录读取超时")); }, 600000);
     });
   }
 
-  function nativeStat(api, absPath) {
+  function nativeStat(api, absPath, cancellable) {
     return new Promise(function (resolve, reject) {
-      var done = false;
-      function fin(v) {
+      var done = false, timer;
+      function fin(v, error) {
         if (done) return;
         done = true;
-        if (v && typeof v.mtimeMs === "number") resolve(v);
+        clearTimeout(timer);
+        var index = _activeRequests.indexOf(cancel);
+        if (index >= 0) _activeRequests.splice(index, 1);
+        if (error) reject(error);
+        else if (v && typeof v.mtimeMs === "number") resolve(v);
         else reject(new Error("stat 无结果"));
       }
+      function cancel() { fin(null, { cancelled: true }); }
+      if (cancellable) {
+        if (state.cancel) { cancel(); return; }
+        _activeRequests.push(cancel);
+      }
+      timer = setTimeout(function () { fin(null, new Error("stat 超时")); }, 30000);
       try {
         var r = api.getPcFileStats({ filepath: absPath, tag: "st_" + Math.random().toString(36).slice(2, 8) }, fin);
         if (r && typeof r.then === "function") {
-          r.then(function (v) { if (v !== undefined) fin(v); }).catch(function () {});
+          r.then(function (v) { if (v !== undefined) fin(v); }).catch(function (e) { fin(null, e); });
         }
-      } catch (e) { /* 走超时 */ }
-      setTimeout(function () { if (!done) { done = true; reject(new Error("stat 超时")); } }, 30000);
+      } catch (e) { fin(null, e); }
     });
   }
 
@@ -1079,71 +1562,176 @@
     }
   }
 
-  // 桥接接口实际为 (path, start, onData, onEnd, onError)，会一直读到 EOF。
-  // 它没有定长读取或暂停能力，故只作小文件回退，并串行调用以免全局 IPC 事件串流。
-  var _bridgeReadQueue = Promise.resolve();
-  function readBridgeChunk(api, abs, off, len, size) {
-    if (!api || typeof api.getPcFileStream !== "function") {
-      return Promise.reject(new Error("桌面端无法读取 PC 文件，请用「选择文件夹」重新扫描"));
-    }
-    if (size > BRIDGE_MAX_FILE) {
-      return Promise.reject(new Error("原生桥接读取大文件不安全，请用「选择文件夹」重新扫描"));
-    }
-    return new Promise(function (resolve, reject) {
-      var parts = [], got = 0, done = false, timer;
-      function finish(error) {
-        if (done) return;
-        done = true;
-        clearTimeout(timer);
-        if (error) reject(error);
-        else if (got !== len) reject(new Error("读取的文件分块长度不符，请重新扫描目录"));
-        else resolve(new Blob(parts));
-      }
-      function armTimer() {
-        if (done) return;
-        clearTimeout(timer);
-        timer = setTimeout(function () { finish(new Error("读取 PC 文件超时")); }, 30000);
-      }
-      try {
-        api.getPcFileStream(abs, off, function (value) {
-          if (done) return;
-          var bytes = toBytes(value);
-          if (!bytes) { finish(new Error("桌面端返回了无法识别的文件数据")); return; }
-          var keep = Math.min(bytes.length, len - got);
-          if (keep > 0) { parts.push(bytes.subarray(0, keep)); got += keep; }
-          armTimer();
-        }, function () { finish(); }, function (error) {
-          finish(new Error("读取 PC 文件失败：" + (error && error.message || error)));
-        });
-        armTimer();
-      } catch (error) { finish(error); }
-    });
-  }
-
-  function readPcChunk(api, abs, off, len, size) {
+  function readPcChunk(api, abs, off, len, size, opts) {
     var fs = getPcFs();
     if (fs) return readNodeChunk(fs, abs, off, len);
-    var task = _bridgeReadQueue.then(function () {
-      return readBridgeChunk(api, abs, off, len, size);
-    });
-    _bridgeReadQueue = task.catch(function () {});
-    return task;
+    // getPcFileStream 通道禁用（无取消/无背压 + preload 每 chunk 一条 warn 转发，
+    // 降级读大文件曾造成日志海啸）。无 Node fs 的环境一律拒绝。
+    return Promise.reject(new Error("此环境无法分块读取 PC 文件，请重新选择目录"));
   }
 
   function readEntryChunk(ent, off, end) {
     if (ent.file) return Promise.resolve(ent.file.slice(off, end));
-    return readPcChunk(getBridge(), ent.abs, off, end - off, ent.size);
+    return readPcChunk(getBridge(), ent.abs, off, end - off, ent.size, { allowLargeChunk: true });
+  }
+
+  var _webDavCredCache = null;
+  function fetchWebDavCreds() {
+    if (_webDavCredCache) return _webDavCredCache;
+    _webDavCredCache = requestJson("/cgi-bin/luci/filemgr/get_pool_info", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: "{}"
+    }, true).then(function (j) {
+      var w = j && j.data && j.data.webDAV;
+      if (!w) throw new Error("无法获取 WebDAV 凭证");
+      return w;
+    }).catch(function (e) {
+      _webDavCredCache = null; // 失败可重试
+      throw e;
+    });
+    return _webDavCredCache;
+  }
+
+  var _nativeTransfers = Object.create(null);
+  function nativeNoop() {}
+
+  // The host preload retains upload listeners. Keep only a small tag in its
+  // callbacks; delete the corresponding task state and timers on every exit.
+  function nativeCallbacks(tag) {
+    return {
+      progress: function (p) { var t = _nativeTransfers[tag]; if (t) t.progress(p); },
+      done: function (st) { var t = _nativeTransfers[tag]; if (t) t.finish(null, st); },
+      fail: function (e) {
+        var t = _nativeTransfers[tag];
+        if (t) t.finish(new Error("原生上传失败：" + (e && (e.message || e.code) || e)));
+      }
+    };
+  }
+
+  function waitNativeUpload(bridge, task, onProgress) {
+    return new Promise(function (resolve, reject) {
+      var tag = task.tag, idleTimer, totalTimer, lastBytes = 0, done = false, unsubscribe;
+      function finish(err, stat) {
+        if (done) return;
+        done = true;
+        clearTimeout(idleTimer); clearTimeout(totalTimer);
+        delete _nativeTransfers[tag];
+        if (typeof unsubscribe === "function") { try { unsubscribe(); } catch (e) {} }
+        if (err) reject(err); else resolve(stat);
+      }
+      function stop(err) {
+        err.transportUncertain = true;
+        // Settle independently of an absent/late pause or upload callback.
+        finish(err);
+        try {
+          if (typeof bridge.pauseUpload === "function") bridge.pauseUpload(tag, true, nativeNoop);
+        } catch (e) {}
+      }
+      function timeout() { stop(new Error("原生上传长时间无进展或已超时，可再次继续备份")); }
+      function armIdle() { clearTimeout(idleTimer); idleTimer = setTimeout(timeout, NATIVE_IDLE_MS); }
+      _nativeTransfers[tag] = {
+        finish: finish, stop: stop,
+        progress: function (p) {
+          var bytes = p && p.transferred;
+          if (typeof bytes === "number" && bytes > lastBytes) {
+            lastBytes = bytes; armIdle();
+            if (onProgress) onProgress(p);
+          }
+        }
+      };
+      if (state.cancel) { stop({ cancelled: true }); return; }
+      armIdle();
+      totalTimer = setTimeout(timeout, NATIVE_TOTAL_MS);
+      var callbacks = nativeCallbacks(tag);
+      try {
+        var result = bridge.upLoadToNas(task, callbacks.progress, callbacks.done, callbacks.fail, nativeNoop);
+        if (typeof result === "function") {
+          if (done) result(); else unsubscribe = result;
+        }
+        else if (result && typeof result.then === "function") result.catch(function (e) { finish(e); });
+      } catch (e) { finish(e); }
+    });
+  }
+
+  function uploadViaNative(job, ent, rel, size, mtime, offset, onProgress, generation) {
+    generation = generation || (state.plan && state.plan.generation);
+    var bridge = getBridge();
+    if (!bridge || typeof bridge.upLoadToNas !== "function") {
+      return Promise.reject(new Error("桌面端缺少原生上传接口，无法传输大文件"));
+    }
+    var info, nativeError;
+    function checkSource() {
+      if (state.cancel) return Promise.reject({ cancelled: true });
+      return nativeStat(bridge, ent.abs, true).then(function (st) {
+        if (st.size !== size || Math.abs(Math.floor(st.mtimeMs) - mtime) > 1) {
+          var changed = new Error("PC 文件已变化，请重新扫描目录");
+          changed.status = 409;
+          throw changed;
+        }
+      });
+    }
+    return checkSource().then(function () {
+      return withRetry(function () {
+        return api("POST", "api/jobs/" + job.id + "/native-upload",
+          { action: "prepare", p: rel, s: size, m: mtime, source: ent.abs,
+            run_id: state.resumeRunId || "", generation: generation });
+      }, "准备原生上传 " + rel);
+    }).then(function (prepared) {
+      info = prepared;
+      if (!info || !/^[0-9a-f]{32}$/.test(info.token)) throw new Error("原生上传准备响应无效，请更新插件");
+      if (info.uploaded) return;
+      return fetchWebDavCreds().then(function (webDAV) {
+        if (state.cancel) throw { cancelled: true };
+        var root = (webDAV.poolRoot || "/pool0/data").replace(/\/$/, "") + "/.temp_upload_dir/";
+        return waitNativeUpload(bridge, {
+            sPath: ent.abs,
+            dPath: root + info.temp_name,
+            realdpath: root + info.ready_name,
+            offset: 0,
+            isNeedHead: false,
+            reUse: false,
+            tag: "pcb_" + info.token,
+            webParam: JSON.stringify(webDAV),
+            size: size,
+            mtime: mtime || 0
+          }, onProgress).catch(function (e) {
+            if (e.cancelled || e.transportUncertain) throw e;
+            _webDavCredCache = null;
+            nativeError = e; // A full PUT can still be reconciled after MOVE failed.
+          });
+      });
+    }).then(function () {
+      return withRetry(function () {
+        return checkSource().then(function () {
+          return api("POST", "api/jobs/" + job.id + "/native-upload",
+            { action: "finalize", p: rel, token: info.token, generation: generation });
+        });
+      }, "确认原生文件 " + rel).then(function (result) {
+        if (!result || !result.committed) throw new Error("原生上传确认响应无效，请更新插件");
+        return result;
+      }).catch(function (e) {
+          if (e.cancelled) throw e;
+          if (nativeError) e.message = nativeError.message + "；" + e.message;
+          throw e;
+        });
+    });
   }
 
   // 原生读取入口：整树 → 排除过滤 → 并发补 mtime → 走既有比对流水
-  function nativePick(pcPath) {
+  function nativePick(pcPath, pick) {
     var job = state.job;
     var bridge = getBridge();       // 注意：不能叫 api——会遮蔽同名 HTTP 助手（踩过）
     if (!bridge) { toast("该功能需在桌面 App 内使用（当前浏览器请点上方「选择文件夹」）", true); return; }
     if (!pcPath) { toast("先填 PC 目录绝对路径，或把文件夹拖进框里取路径", true); return; }
+    pick = pick || beginPick();
+    if (!currentPick(pick)) return;
+    if (state.browserResumeRequested) { $("dirInput").click(); return; }
     setPickStatus("正在读取目录：" + pcPath + " …");
     nativeListDir(bridge, pcPath).then(function (data) {
-      var files = (data && data.files) || [];
+      if (!currentPick(pick)) return;
+      if (!data || !Array.isArray(data.files)) throw new Error("目录读取结果无效，请重新选择");
+      var files = data.files;
       var rootNorm = pcPath.replace(/[\\/]+$/, "");
       var entries = [], seen = {}, skippedOut = 0;
       for (var i = 0; i < files.length; i++) {
@@ -1159,16 +1747,13 @@
         seen[rel] = 1;
         entries.push({ rel: rel, abs: full, size: files[i].size || 0, mtime: 0 });
       }
-      if (!entries.length) {
-        setPickStatus(null);
-        toast("该目录下没有可备份的文件（排除后为空）" + (skippedOut ? "；另有 " + skippedOut + " 个越界路径被跳过" : ""), true);
-        return;
-      }
       entries.sort(function (a, b) { return a.rel < b.rel ? -1 : 1; });
       setPickStatus("正在读取文件时间戳… 0 / " + entries.length);
       var t0 = Date.now(), done = 0, statFail = 0, failSamples = [];
       return mapLimit(entries, 64, function (e) {
+        if (!currentPick(pick)) return null;
         return nativeStat(bridge, e.abs).then(function (st) {
+          e.size = st.size;
           // 必须截断到毫秒（与浏览器 File.lastModified 同口径）——
           // 四舍五入会与账本差 1ms，把约 1/4 的文件误判为变更（踩过：12711 个假变更）
           e.mtime = Math.floor(st.mtimeMs);
@@ -1178,12 +1763,13 @@
           if (failSamples.length < 5) failSamples.push(e.abs);
         }).then(function () {
           done++;
-          if (done % 2000 === 0 || done === entries.length) {
+          if (currentPick(pick) && (done % 2000 === 0 || done === entries.length)) {
             setPickStatus("正在读取文件时间戳… " + done + " / " + entries.length +
               "（" + ((Date.now() - t0) / 1000).toFixed(0) + "s）");
           }
         });
       }).then(function () {
+        if (!currentPick(pick)) return;
         setPickStatus(null);
         if (statFail) {
           log("[目录读取] ⚠ " + statFail + " 个文件取不到 mtime（会被判变更重传）：" + failSamples.join(" | "), "lg-err");
@@ -1191,106 +1777,82 @@
         // 根目录名取末段：Windows 路径是反斜杠，必须先归一化，
         // 否则 "D:\work" 整串被当目录名，触发假的 folder_mismatch（踩过）
         var leaf = rootNorm.replace(/\\/g, "/").split("/").pop() || "目录";
-        state.sourcePath = pcPath;
-        finishPick(entries, leaf, "读取目录" + (statFail ? "（mtime 取不到 " + statFail + " 个）" : ""),
-          files.length - entries.length - skippedOut);
-        // 记住路径：下次打开任务直接用
-        api("PATCH", "api/jobs/" + job.id, { pc_path: pcPath }).catch(function () {});
+        if (!currentPick(pick)) return;
+        // Saving a source changes the request generation. Do it before scanning
+        // so the new plan cannot be invalidated by our own delayed PATCH.
+        var rememberAttempts = 0;
+        function rememberSource() {
+          if (!currentPick(pick)) return Promise.resolve();
+          return api("PATCH", "api/jobs/" + job.id,
+            { pc_path: pcPath, expected_pc_path: job.pc_path || "",
+              selection_session: sourceSelectionSession, selection_seq: pick.token }).catch(function (error) {
+              if (currentPick(pick) && error.data && error.data.reason === "source_changed" && ++rememberAttempts < RETRY_MAX) {
+                job.pc_path = error.data.pc_path;
+                return rememberSource();
+              }
+              throw error;
+            });
+        }
+        return rememberSource().then(function () {
+          if (!currentPick(pick)) return;
+          job.pc_path = pcPath;
+          state.sourcePath = pcPath;
+          finishPick(entries, leaf, "读取目录" + (statFail ? "（mtime 取不到 " + statFail + " 个）" : ""),
+            files.length - entries.length - skippedOut, pick);
+        });
       });
     }).catch(function (e) {
+      if (!currentPick(pick)) return;
       setPickStatus(null);
       toast("读取目录失败：" + (e && e.message), true);
     });
   }
 
-  // 原生目录选择框 v2——真机实测规律：
-  //   带函数回调 → IPC clone 必炸；带字符串占位 → 被门面校验拦下（不弹框）；
-  //   纯 task 零回调 → 弹框成功 ✓，但结果被门面丢弃。
-  // 结果捕获假说：对话框结果走 ipc 事件 → 用 listenToMain 订阅（名字逐个试，
-  // fn.length 先探签名），兜底翻"最近选择"痕迹。
-  var _browseSeq = 0;
-  function npLogLine(msg) {
-    var box = $("npLog");
-    if (box) {
-      var div = document.createElement("div");
-      div.textContent = msg;
-      box.appendChild(div);
-      box.scrollTop = box.scrollHeight;
-    }
-    try { console.log("[browse] " + msg); } catch (e) {}
-  }
-
+  // 原生目录选择框。preload 真实签名（反混淆 bridge.js 确认）：
+  //   openFileDialog(onResult, type, extensions)
+  //   → ipcRenderer.send("openFileDialog", type, extensions)
+  //   → 结果 {canceled, filePaths} 从 "openFileDialog_replay" once 回传给 onResult。
+  // 主进程按 type 分支：'folder' → [openDirectory, multiSelections]。
+  // 旧版把 task 对象当第 1 参传，回调位是对象（replay 调用它即抛错）、type 也不命中
+  // 任何分支，结果永远收不到——30 秒兜底超时报「没有捕获到选择结果」。
+  var _browseBusy = false;
   function nativeBrowse() {
+    if (state.running) { toast("正在传输，先取消再重新选目录", true); return; }
+    if (state.browserResumeRequested) { $("dirInput").click(); return; }
     var bridge = getBridge();
     if (!bridge) { toast("「浏览…」需在桌面 App 内使用", true); return; }
-    var tag = "br" + (++_browseSeq) + "_" + Date.now();
-    var got = false;
-
-    function onResult(v) {
-      if (v === undefined || v === null) return;
-      npLogLine("收到结果：" + JSON.stringify(v).slice(0, 200));
-      if (got) return;
-      var p = extractWinPath(v);
-      if (p) {
-        got = true;
-        $("npPickPath").value = p;
-        toast("✓ 选目录成功：" + p);
-        nativePick(p);   // 显式选好目录＝确认，直接开始
-      }
+    if (typeof bridge.openFileDialog !== "function") {
+      toast("当前桌面端不支持目录选择框，请直接输入路径后点「确认」", true);
+      return;
     }
-
-    // 探签名 + 多名字武装监听
+    if (_browseBusy) return;   // dialog 回调是一次性 once，防重复弹框串结果
+    var pick = beginPick();
+    _browseBusy = true;
+    var armed = false;
+    function done() { _browseBusy = false; }
     try {
-      npLogLine("listenToMain.length = " + (bridge.listenToMain ? bridge.listenToMain.length : "无此函数"));
-    } catch (e) {}
-    var names = ["openFileDialog", "openFileDialog_" + tag, tag, "fileDialog", "file-dialog",
-                 "dialog", "openDirectory", "selectFolder", "selectedPath", "folderSelected"];
-    names.forEach(function (n) {
-      try {
-        var r = bridge.listenToMain(n, onResult);
-        npLogLine("listenToMain('" + n + "') → " + String(r).slice(0, 40));
-        if (r && typeof r.then === "function") {
-          r.then(function (v) { if (v !== undefined) onResult(v); }).catch(function () {});
+      bridge.openFileDialog(function (v) {
+        armed = true;
+        done();
+        if (!currentPick(pick)) return;
+        if (!v || v.canceled) { setPickStatus(null); return; }
+        var p = extractWinPath(v);
+        if (p) {
+          $("npPickPath").value = p;
+          toast("✓ 选目录成功：" + p);
+          nativePick(p, pick);   // 显式选好目录＝确认，直接开始
+        } else {
+          toast("没有捕获到选择结果", true);
         }
-      } catch (e) {
-        npLogLine("listenToMain('" + n + "') 抛：" + (e && e.message));
-      }
-    });
-    // 签名若只有 1 参，再试纯回调订阅
-    try {
-      if (bridge.listenToMain && bridge.listenToMain.length <= 1) {
-        var r0 = bridge.listenToMain(onResult);
-        npLogLine("listenToMain(纯回调) → " + String(r0).slice(0, 40));
-      }
-    } catch (e) { npLogLine("listenToMain(纯回调) 抛：" + (e && e.message)); }
-
-    // 弹框：零回调姿势（唯一实测能弹框的）
-    try {
-      var r2 = bridge.openFileDialog({ properties: ["openDirectory", "createDirectory"], tag: tag });
-      npLogLine("openFileDialog(task) 同步返回：" + String(r2).slice(0, 40));
-      if (r2 && typeof r2.then === "function") {
-        r2.then(function (v) { if (v !== undefined) onResult(v); }).catch(function () {});
-      }
+      }, "folder");
     } catch (e) {
+      done();
       toast("openFileDialog 抛异常：" + (e && e.message), true);
       return;
     }
     toast("已打开目录选择框——选好后自动开始读取");
-
-    // 兜底：30 秒没等到就翻"最近选择"痕迹
-    setTimeout(function () {
-      if (got) return;
-      try {
-        var d = bridge.getDropFilePaths([]);
-        npLogLine("兜底 getDropFilePaths([]) → " + JSON.stringify(d).slice(0, 120));
-        if (Array.isArray(d) && d.length) onResult(d);
-      } catch (e) { npLogLine("兜底 getDropFilePaths 抛：" + (e && e.message)); }
-      try {
-        var l = bridge.localFileList({ tag: tag }, onResult, function () {}, function () {});
-        npLogLine("兜底 localFileList 同步返回：" + String(l).slice(0, 40));
-      } catch (e) {}
-      if (!got) toast("没捕获到选择结果——把探测台/控制台日志贴回来", true);
-    }, 30000);
+    // 回调从未到达（主进程异常等）：解除占用，允许重试
+    setTimeout(function () { if (!armed) done(); }, 60000);
   }
 
   // 从各种返回形状里挖 Windows 绝对路径
@@ -1331,25 +1893,30 @@
 
   function traverseEntry(entry, onFile) {
     // 递归读取拖入的目录项，返回 Promise<[{rel, file}]>
-    return new Promise(function (resolve) {
+    return new Promise(function (resolve, reject) {
+      function failed() { reject(new Error("无法读取 " + (entry.fullPath || entry.name) + "，请检查后重新选择目录")); }
       if (entry.isFile) {
         entry.file(function (f) {
           f._relPath = entry.fullPath.replace(/^\//, "");
           if (onFile) onFile();
           resolve([{ rel: f._relPath, file: f }]);
-        }, function () { resolve([]); });
+        }, failed);
       } else if (entry.isDirectory) {
         var reader = entry.createReader();
         var all = [];
         function readBatch() {
           reader.readEntries(function (batch) {
             if (!batch.length) {
-              Promise.all(all).then(function (xs) { resolve([].concat.apply([], xs)); });
+              Promise.all(all).then(function (xs) { resolve([].concat.apply([], xs)); }, reject);
               return;
             }
-            batch.forEach(function (e) { all.push(traverseEntry(e, onFile)); });
+            batch.forEach(function (e) {
+              var pending = traverseEntry(e, onFile);
+              pending.catch(function () {}); // Observe errors before the reader delivers its final batch.
+              all.push(pending);
+            });
             readBatch();
-          }, function () { resolve([]); });
+          }, failed);
         }
         readBatch();
       } else {
@@ -1365,7 +1932,8 @@
     dz.addEventListener("click", function (e) {
       // 输入框/按钮区域的点击不触发选择框
       if (e.target.closest && e.target.closest(".np-entry")) return;
-      if (getBridge()) { nativeBrowse(); return; }
+      if (state.running) { toast("正在传输，先取消再重新选目录", true); return; }
+      if (getBridge() && !state.browserResumeRequested) { nativeBrowse(); return; }
       setPickStatus("正在打开文件夹选择器——选择目录后，浏览器需要时间读取文件（大目录可能几十秒），期间界面可能短暂无响应，请耐心等待，不是死机…");
       input.click();
     });
@@ -1375,6 +1943,8 @@
       // 否则分块筛选从第二块起读到 undefined（TypeError 链条中断）
       var picked = Array.prototype.slice.call(input.files);
       input.value = "";
+      var pick = beginPick();
+      if (!pick) return;
       var root = "";
       for (var i = 0; i < picked.length; i++) {
         var rp = picked[i].webkitRelativePath || picked[i].name;
@@ -1382,12 +1952,12 @@
       }
       setPickStatus("正在读取目录（" + picked.length + " 个文件）…");
       setTimeout(function () {
-        onPicked(picked, root || "目录");
+        onPicked(picked, root || "目录", pick);
       }, 30);
     });
 
     // 经典拖拽：读 File 对象走 webkitdirectory 同款流水
-    function classicDrop(e) {
+    function classicDrop(e, pick) {
       var items = e.dataTransfer && e.dataTransfer.items;
       if (!items || !items.length) return;
       var entries = [];
@@ -1399,6 +1969,7 @@
       if (!entries.length) return;
       var found = 0, lastUpd = 0;
       var onFile = function () {
+        if (!currentPick(pick)) return;
         found++;
         var now = Date.now();
         if (now - lastUpd > 200) {
@@ -1408,13 +1979,17 @@
       };
       setPickStatus("正在读取拖入的目录…");
       Promise.all(entries.map(function (en) { return traverseEntry(en, onFile); })).then(function (xs) {
+        if (!currentPick(pick)) return;
         var flat = [].concat.apply([], xs);
-        if (!flat.length) { setPickStatus(null); toast("没有读到文件", true); return; }
         var files = flat.map(function (x) { return x.file; });
         // 多个拖入项时用第一项名字当根目录
         var fake = { length: files.length };
         for (var j = 0; j < files.length; j++) fake[j] = files[j];
-        onPicked(fake, rootName);
+        onPicked(fake, rootName, pick);
+      }).catch(function (error) {
+        if (!currentPick(pick)) return;
+        setPickStatus(null);
+        toast("读取目录失败：" + error.message, true);
       });
     }
 
@@ -1425,19 +2000,22 @@
       dz.addEventListener(ev, function (e) { e.preventDefault(); e.stopPropagation(); dz.classList.remove("drag"); });
     });
     dz.addEventListener("drop", function (e) {
+      var pick = beginPick();
+      if (!pick) return;
       // 桌面 App 内优先取绝对路径走原生读取（显式拖放＝确认）；取不到回退经典读取
-      if (getBridge()) {
+      if (getBridge() && !state.browserResumeRequested) {
         nativeDropPath(e).then(function (p) {
+          if (!currentPick(pick)) return;
           if (p) {
             $("npPickPath").value = p;
-            nativePick(p);
+            nativePick(p, pick);
           } else {
-            classicDrop(e);
+            classicDrop(e, pick);
           }
         });
         return;
       }
-      classicDrop(e);
+      classicDrop(e, pick);
     });
   }
 
@@ -1447,7 +2025,11 @@
     $("btnNewJob").addEventListener("click", function () { openJobModal(null); });
     $("btnResume").addEventListener("click", resumeBackup);
     $("btnResumeFresh").addEventListener("click", function () {
+      state.pickToken = (state.pickToken || 0) + 1;
+      state.scanToken = (state.scanToken || 0) + 1;
       state.resumeInfo = null;
+      state.resumeRunId = null;
+      state.browserResumeRequested = false;
       state.discardResumeOnRun = true;
       $("stepResume").hidden = true;
       $("stepPick").hidden = false;
@@ -1461,12 +2043,14 @@
     $("btnBackFromBrowse").addEventListener("click", function () { show("view-jobs"); });
     $("btnRepick").addEventListener("click", function () {
       if (state.running) { toast("正在传输，先取消再重新选目录", true); return; }
+      beginPick();
       resetSteps();
     });
     $("btnCancel").addEventListener("click", function () {
       state.cancel = true;
+      abortAllUploads();   // 立即断掉进行中的 PUT，不等当前文件传完
       $("btnCancel").disabled = true;
-      log("正在取消…（当前文件传输完成后停止）", "lg-err");
+      log("正在取消传输，已完成的文件会保留…", "lg-err");
     });
     $("btnDoneBack").addEventListener("click", function () { show("view-jobs"); loadJobs(); });
     $("btnDoneAgain").addEventListener("click", function () {

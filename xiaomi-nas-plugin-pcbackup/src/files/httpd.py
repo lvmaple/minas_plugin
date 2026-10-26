@@ -11,6 +11,7 @@
 判定"是否变更"：大小 + 修改时间（毫秒），与 rsync 默认快速判定一致。
 """
 import fnmatch
+import hashlib
 import json
 import os
 import re
@@ -19,6 +20,8 @@ import sys
 import threading
 import time
 import uuid
+from contextlib import contextmanager
+from functools import lru_cache, wraps
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import urlparse, parse_qs, unquote
 
@@ -28,6 +31,7 @@ except ImportError:
     pwd = None
 
 PORT = int(os.environ.get("PLUG_PORT", "9303"))
+PLUGIN_VERSION = "1.6.4"
 _FILES_DIR = os.path.dirname(os.path.abspath(__file__))          # <plugin>/src/files
 PLUGIN_ROOT = os.path.dirname(os.path.dirname(_FILES_DIR))       # <plugin>/
 DATA_DIR = os.environ.get("PCBACKUP_DATA") or os.path.join(PLUGIN_ROOT, "etc")
@@ -35,6 +39,7 @@ JOBS_DIR = os.path.join(DATA_DIR, "jobs")
 JOBS_FILE = os.path.join(DATA_DIR, "jobs.json")
 HISTORY_FILE = os.path.join(DATA_DIR, "history.json")
 RESUME_FILENAME = "pending-run.json"
+_RESUME_ID_CACHE = {}             # jid -> (checkpoint stamp, run_id); never keep the file list
 
 PLUG_USER = os.environ.get("PLUG_USER", "")
 # 用户在 App「我的数据」里对应的根目录（任务只需填这下面的子目录）
@@ -45,6 +50,9 @@ PART_SUFFIX = ".pcbp.part"
 JSON_BODY_MAX = 128 * 1024 * 1024        # scan 请求可能携带几十万文件元数据
 CHUNK_BODY_MAX = 512 * 1024 * 1024       # 单块上限（前端默认 8MiB）
 HISTORY_KEEP = 100
+MKDIRS_BATCH_MAX = 2000
+NATIVE_RETIRE_GRACE = 7 * 86400          # Longer than the desktop's six-hour upload limit
+NATIVE_GC_INTERVAL = 3600
 TOMBSTONE_SOFT_LIMIT = 10                # 删除数 ≥ 此值且占比 >20% 时需要 force 确认
 TOMBSTONE_RATIO = 0.2
 ADOPT_TOLERANCE_MS = 2000                # 认领存量文件时的 mtime 容差（毫秒）
@@ -61,18 +69,107 @@ DEFAULT_EXCLUDES = (
 DEST_ALLOWED_PREFIXES = ("/nas/pool0/", "/home/", "/tmp/", "/mnt/", "/media/", "/srv/")
 
 _JOBS_LOCK = threading.RLock()
+_SOURCE_SELECTIONS = {}          # jid -> page session -> latest directory-pick sequence
+_HISTORY_LOCK = threading.RLock()
+_GENERATION_UNSET = object()
 _JOB_LOCKS = {}
 _UPLOAD_LOCKS = {}
+_LIFECYCLE_LOCKS = {}
+_LOCKS_LOCK = threading.RLock()
+_FINISH_LOCK = threading.RLock()  # never acquire job/lifecycle locks while held
+_FINISH_ACTIVE = {}              # intent path -> (request_id, cancellation event)
+_FINISH_WRITE_ERRORS = {}        # surface failed receipt writes until explicit retry
+_RESUME_CHECKS = {}              # jid -> one read-only asynchronous check
+_NATIVE_GC_LOCK = threading.Lock()
 
 
 def _job_lock(jid):
-    with _JOBS_LOCK:
+    with _LOCKS_LOCK:
         return _JOB_LOCKS.setdefault(jid, threading.RLock())
 
 
 def _upload_lock(key):
-    with _JOBS_LOCK:
+    with _LOCKS_LOCK:
         return _UPLOAD_LOCKS.setdefault(key, threading.RLock())
+
+
+class _JobLifecycle:
+    """Concurrent file operations; exclusive changes wait for their completion.
+
+    Lock order: lifecycle -> file -> short manifest lock. Never wait for a
+    lifecycle permit while holding _JOBS_LOCK. Writers may reenter helpers.
+    """
+    def __init__(self):
+        self.condition = threading.Condition(threading.RLock())
+        self.readers = {}
+        self.writer = None
+        self.depth = 0
+        self.waiting = 0
+
+    @contextmanager
+    def permit(self, exclusive=False):
+        tid = threading.get_ident()
+        with self.condition:
+            if exclusive:
+                if self.writer == tid:
+                    self.depth += 1
+                else:
+                    if tid in self.readers:
+                        raise RuntimeError("Cannot upgrade a file operation to a lifecycle change")
+                    self.waiting += 1
+                    try:
+                        self.condition.wait_for(lambda: self.writer is None and not self.readers)
+                        self.writer, self.depth = tid, 1
+                    finally:
+                        self.waiting -= 1
+            else:
+                self.condition.wait_for(lambda: self.writer == tid or (
+                    self.writer is None and (not self.waiting or tid in self.readers)))
+                self.readers[tid] = self.readers.get(tid, 0) + 1
+        try:
+            yield
+        finally:
+            with self.condition:
+                if exclusive:
+                    self.depth -= 1
+                    if not self.depth:
+                        self.writer = None
+                else:
+                    self.readers[tid] -= 1
+                    if not self.readers[tid]:
+                        del self.readers[tid]
+                self.condition.notify_all()
+
+
+def _lifecycle(jid):
+    with _LOCKS_LOCK:
+        return _LIFECYCLE_LOCKS.setdefault(jid, _JobLifecycle())
+
+
+def _job_operation(exclusive=False, check=True):
+    def decorate(fn):
+        @wraps(fn)
+        def run(job, *args, **kwargs):
+            jid = job["id"] if isinstance(job, dict) else job
+            # HTTP handlers always supply this, including None for old pages.
+            # Internal helpers already carry a checked job/lifecycle context.
+            expected_generation = kwargs.pop("expected_generation", _GENERATION_UNSET)
+            with _lifecycle(jid).permit(exclusive):
+                if check and isinstance(job, dict):
+                    current = load_jobs().get(jid)
+                    if current is None:
+                        return 404, "任务不存在"
+                    if any(current.get(k) != job.get(k) for k in ("destination", "exclude", "pc_path")):
+                        return 409, "任务配置已变化，请刷新任务"
+                if expected_generation is not _GENERATION_UNSET:
+                    if (not isinstance(expected_generation, str)
+                            or not re.fullmatch(r"[0-9a-f]{32}", expected_generation)
+                            or expected_generation != _native_generation(job)):
+                        return 409, {"reason": "transfer_stale",
+                                     "message": "备份计划已变化或页面版本过旧，请刷新后继续备份或重新扫描"}
+                return fn(job, *args, **kwargs)
+        return run
+    return decorate
 
 
 # ── 路径安全（核心！插件以 root 运行） ──────────────────────
@@ -140,14 +237,29 @@ def validate_dest(dest):
     return _canonical_dest(dest) is not None
 
 
+@lru_cache(maxsize=16)
+def _owner_ids(user):
+    pw = pwd.getpwnam(user)
+    return pw.pw_uid, pw.pw_gid
+
+
+def _set_native_owner(fd, st):
+    if pwd is not None and PLUG_USER and os.geteuid() == 0:
+        uid, gid = _owner_ids(PLUG_USER)
+        if (st.st_uid, st.st_gid) != (uid, gid):
+            os.fchown(fd, uid, gid)
+
+
 def _try_chown(path):
     """服务以 root 运行时，把产物归属还给插件用户（SMB 访问需要）。"""
     if pwd is None or not PLUG_USER:
         return
     try:
         if os.geteuid() == 0:
-            pw = pwd.getpwnam(PLUG_USER)
-            os.chown(path, pw.pw_uid, pw.pw_gid)
+            uid, gid = _owner_ids(PLUG_USER)
+            st = os.stat(path)
+            if (st.st_uid, st.st_gid) != (uid, gid):
+                os.chown(path, uid, gid)
     except Exception:
         pass
 
@@ -249,6 +361,11 @@ def _apply_line(m, ln):
     if op == "excl_clear":
         m["excluded"] = []
         return
+    if op == "excl_move":
+        source, target = ln["source"], ln["target"]
+        m["excluded"] = [target + p[len(source):] if p.startswith(source + "/") else p
+                         for p in m["excluded"]]
+        return
     p = ln.get("p", "")
     if not p:
         return
@@ -256,6 +373,8 @@ def _apply_line(m, ln):
     excl = m["excluded"]
     if op == "up":
         ent = {"s": ln.get("s", 0), "m": ln.get("m", 0), "t": ln.get("t", 0)}
+        if ln.get("native_token"):
+            ent["native_token"] = ln["native_token"]
         if ln.get("adopted"):
             ent["adopted"] = True
         files[p] = ent
@@ -347,9 +466,13 @@ def manifest_upsert(job, entries):
                   "s": ent.get("s", 0), "m": ent.get("m", 0), "t": ent.get("t", 0)}
             if ent.get("adopted"):
                 ln["adopted"] = True
-            _apply_line(m, ln)
+            if ent.get("native_token"):
+                ln["native_token"] = ent["native_token"]
             lines.append(ln)
         _run_append(job, lines)
+        # Do not acknowledge an append failure through a successful cache hit.
+        for ln in lines:
+            _apply_line(m, ln)
 
 
 def manifest_del(job, rels):
@@ -381,8 +504,8 @@ def manifest_excl_clear(job):
     with _job_lock(job["id"]):
         m = load_manifest(job)
         ln = {"op": "excl_clear"}
-        _apply_line(m, ln)
         _run_append(job, [ln])
+        _apply_line(m, ln)
 
 
 def manifest_meta(job, folder):
@@ -395,6 +518,7 @@ def manifest_meta(job, folder):
             _run_append(job, [ln])
 
 
+@_job_operation(exclusive=True)
 def manifest_reset(job, folder):
     """目录切换：清空账本、作废全部运行日志，从零重建。返回新账本。
     顺序约束：先作废日志、再原子写主档，最后才换内存缓存——中途失败时旧账本仍在盘上，
@@ -416,6 +540,7 @@ def manifest_reset(job, folder):
         return m
 
 
+@_job_operation(exclusive=True)
 def compact_manifest(job):
     """使用前压实（合并点定在比对前）：把折叠后的内存态写成紧凑主档+镜像，
     并把已折叠的运行日志转 .done（保留最近 RUN_KEEP_DONE 段作审计）。
@@ -448,21 +573,113 @@ def load_history():
 
 
 def append_history(entry):
-    h = load_history()
-    h.append(entry)
-    _save_json(HISTORY_FILE, h[-HISTORY_KEEP:])
+    # Every job shares this file and its temporary replacement path.
+    with _HISTORY_LOCK:
+        h = load_history()
+        h.append(entry)
+        _save_json(HISTORY_FILE, h[-HISTORY_KEEP:])
 
 
 def resume_path(job):
     return os.path.join(job_dir(job["id"]), RESUME_FILENAME)
 
 
+class _ResumeCorrupt(OSError):
+    """Readable checkpoint content cannot be used; explicit rescan may replace it."""
+
+
 def load_resume(job):
-    record = _load_json(resume_path(job), None)
-    return record if isinstance(record, dict) and record.get("version") == 1 else None
+    # A missing checkpoint means no pending run. An unreadable existing one
+    # must stay retryable, rather than becoming a cached successful empty check.
+    try:
+        with open(resume_path(job), "r", encoding="utf-8") as stream:
+            record = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except ValueError as error:
+        raise _ResumeCorrupt("无法解析续传记录，请重新扫描：%s" % error) from error
+    except OSError as error:
+        raise OSError("无法读取续传记录，请重试：%s" % error) from error
+    if not isinstance(record, dict) or record.get("version") != 1:
+        raise _ResumeCorrupt("续传记录格式不受支持，请重新扫描")
+    return record
 
 
-def resume_status(job):
+def _resume_stamp(job):
+    path = resume_path(job)
+    try:
+        st = os.stat(path)
+    except FileNotFoundError:
+        return (path, None)
+    return (path, st.st_dev, st.st_ino, st.st_size, st.st_mtime_ns, st.st_ctime_ns)
+
+
+def _remember_resume_id(job, record):
+    """Caller holds the job lock; cache only the identity of an installed plan."""
+    _RESUME_ID_CACHE[job["id"]] = (_resume_stamp(job), record["run_id"] if record else "")
+
+
+def _resume_run_id(job):
+    """O(1) hot path. A cold start/replaced checkpoint is decoded at most once.
+
+    The stamp also detects atomic replacement or removal outside our lifecycle
+    helpers, so retaining a cached ID cannot authorize a stale native attempt.
+    Caller holds the job lock; concurrent files share the single cold load.
+    """
+    stamp = _resume_stamp(job)
+    cached = _RESUME_ID_CACHE.get(job["id"])
+    if cached is not None and cached[0] == stamp:
+        return cached[1]
+    record = load_resume(job) if stamp[1] is not None else None
+    if _resume_stamp(job) != stamp:
+        raise OSError("续传记录正在变化，请重试")
+    if stamp[1] is not None and record is None:
+        # A transient read/decode failure must not poison this stamp with an
+        # empty ID and reject every later request until the file changes.
+        raise OSError("无法读取续传记录，请重试")
+    run_id = record["run_id"] if record else ""
+    _RESUME_ID_CACHE[job["id"]] = (stamp, run_id)
+    return run_id
+
+
+def _bind_legacy_resume(job, record, generation):
+    """Migrate only a provably unchanged legacy source; never grant a new fence."""
+    if record is not None and "generation" not in record:
+        same = (record.get("destination") == job["destination"]
+                and record.get("exclude") == job.get("exclude", [])
+                and bool(job.get("pc_path"))
+                and record.get("source_path") == job.get("pc_path"))
+        record["generation"] = generation if same else "stale"
+        _save_json(resume_path(job), record)
+        _remember_resume_id(job, record)
+
+
+class _FinishCancelled(Exception):
+    pass
+
+
+class _FinishControl(threading.Event):
+    """Accept cancellation until the final history/result commit starts."""
+    def __init__(self):
+        super().__init__()
+        self.decision_lock = threading.Lock()
+        self.committing = False
+
+    def begin_commit(self):
+        with self.decision_lock:
+            self.committing = True
+            return self.is_set()
+
+    def request_cancel(self, persist):
+        with self.decision_lock:
+            if self.committing:
+                return False
+            persist()
+            self.set()
+            return True
+
+
+def resume_status(job, cancel_event=None):
     """Only inspect files in the saved upload plan; never rescan the PC tree."""
     with _job_lock(job["id"]):
         record = load_resume(job)
@@ -471,22 +688,24 @@ def resume_status(job):
         if (record.get("destination") != job["destination"]
                 or record.get("exclude") != job.get("exclude", [])):
             return 409, {"reason": "resume_stale", "message": "任务目标或排除规则已变化，请重新扫描"}
+        generation = _native_generation(job)
+        _bind_legacy_resume(job, record, generation)
+        if record.get("generation") != generation:
+            return 409, {"reason": "resume_stale", "message": "任务配置已变化，请重新扫描"}
         snapshot = load_manifest(job)
         if snapshot.get("folder") != record.get("folder"):
             return 409, {"reason": "resume_stale", "message": "任务已切换电脑目录，请重新扫描"}
         manifest = snapshot["files"]
         pending, completed, completed_bytes = [], 0, 0
         for rel, size, mtime in record["files"]:
+            if cancel_event is not None and cancel_event.is_set():
+                raise _FinishCancelled()
             entry = manifest.get(rel)
             matches = bool(entry and entry.get("s") == size
                            and abs(entry.get("m", 0) - mtime) <= 1)
             if matches:
                 destf = safe_join(job["destination"], rel)
-                try:
-                    matches = bool(destf and os.path.isfile(destf)
-                                   and os.path.getsize(destf) == size)
-                except OSError:
-                    matches = False
+                matches = bool(destf and _file_matches(destf, size, mtime))
             if matches:
                 completed += 1
                 completed_bytes += size
@@ -495,6 +714,7 @@ def resume_status(job):
         deleted = record["deleted"]
         pending_deleted = [rel for rel in deleted if rel in manifest]
         plan = {
+            "generation": generation,
             "folder": record["folder"], "total_files": record["total_files"],
             "upload": [[rel, size] for rel, size, _ in pending],
             "upload_bytes": sum(size for _, size, _ in pending),
@@ -503,8 +723,11 @@ def resume_status(job):
             "excluded_kept": record["excluded_kept"],
             "previous_uploaded": completed, "previous_bytes": completed_bytes,
             "previous_deleted": len(deleted) - len(pending_deleted),
+            "type_archives": record.get("type_archives", {}),
         }
         return 200, {
+            "generation": generation,
+            "source_kind": record.get("source_kind", "native"),
             "run_id": record["run_id"], "source_path": record["source_path"],
             "started": record["started"], "del_mode": record["del_mode"],
             "prune_excluded": record["prune_excluded"], "files": pending,
@@ -512,9 +735,15 @@ def resume_status(job):
         }
 
 
+@_job_operation(exclusive=True)
 def start_resume(job, body):
+    source_kind = body.get("source_kind", "native")
     source_path = _clean_pc_path(body.get("source_path"))
-    if not source_path or not re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", source_path):
+    if source_kind not in ("native", "browser"):
+        return 400, "备份来源类型无效"
+    if source_kind == "browser":
+        source_path = ""
+    elif not source_path or not re.match(r"^(?:[A-Za-z]:[\\/]|\\\\)", source_path):
         return 400, "续传需要有效的 PC 绝对路径"
     with _job_lock(job["id"]):
         st = _SCAN_STATE.get(job["id"])
@@ -527,6 +756,7 @@ def start_resume(job, body):
         existing = load_resume(job)
         if existing:
             if (existing.get("scan_id") == st["scan_id"]
+                    and existing.get("source_kind", "native") == source_kind
                     and existing.get("source_path") == source_path
                     and existing.get("del_mode") == ("delete" if body.get("del_mode") == "delete" else "del")
                     and existing.get("prune_excluded") == bool(body.get("prune_excluded"))):
@@ -537,8 +767,9 @@ def start_resume(job, body):
         incoming = st["incoming"]
         record = {
             "version": 1, "run_id": uuid.uuid4().hex, "scan_id": st["scan_id"],
+            "generation": _native_generation(job),
             "started": int(time.time()),
-            "source_path": source_path, "destination": job["destination"],
+            "source_path": source_path, "source_kind": source_kind, "destination": job["destination"],
             "exclude": job.get("exclude", []), "folder": plan["folder"],
             "total_files": plan["total_files"],
             "files": [[rel, size, incoming[rel][1]] for rel, size in plan["upload"]],
@@ -547,41 +778,116 @@ def start_resume(job, body):
             "excluded_kept": plan["excluded_kept"],
             "del_mode": "delete" if body.get("del_mode") == "delete" else "del",
             "prune_excluded": bool(body.get("prune_excluded")),
+            "type_archives": plan.get("type_archives", {}),
         }
         _save_json(resume_path(job), record)
+        _remember_resume_id(job, record)
         return resume_status(job)
 
 
-def finish_run(job, stats):
+@_job_operation(exclusive=True)
+def prepare_type_conflicts(job, run_id):
+    """Preserve a directory before a planned file replaces it, once per run.
+
+    The archive names are persisted with the plan before any rename. Retrying
+    after a lost response or process restart also finishes exclusion bookkeeping.
+    """
+    record = load_resume(job)
+    if not record or record["run_id"] != run_id or record.get("generation") != _native_generation(job):
+        return 409, "备份计划已变化，请刷新任务"
+    archived = 0
+    with _job_lock(job["id"]):
+        manifest = load_manifest(job)
+        lines = []
+        for rel, archive_rel in record.get("type_archives", {}).items():
+            source = safe_join(job["destination"], rel)
+            target = safe_join(job["destination"], archive_rel)
+            if source is None or target is None:
+                return 400, "目录保留路径非法"
+            if os.path.isdir(source):
+                if os.path.lexists(target):
+                    return 409, "保留目录已被占用，请重新扫描"
+                os.rename(source, target)
+                archived += 1
+            if os.path.isdir(target) and any(p.startswith(rel + "/") for p in manifest["excluded"]):
+                lines.append({"op": "excl_move", "source": rel, "target": archive_rel})
+        if lines:
+            _run_append(job, lines)
+            for line in lines:
+                _apply_line(manifest, line)
+    return 200, {"archived": archived}
+
+
+def _previous_finish(job, run_id, request_id):
+    def matches(entry):
+        if (not isinstance(entry, dict) or entry.get("job_id") != job["id"]
+                or entry.get("run_id") != run_id
+                or entry.get("status") not in ("ok", "partial", "cancelled")):
+            return False
+        return bool((run_id and entry["status"] == "ok")
+                    or (request_id and entry.get("request_id") == request_id))
+
+    previous = next((h for h in reversed(load_history()) if matches(h)), None)
+    if previous is not None:
+        return previous
+    # Global history is capped at HISTORY_KEEP. The per-job result is saved
+    # before deleting its checkpoint, and survives other jobs rolling history.
+    # Read the current persisted job, not the worker's potentially old snapshot.
+    with _JOBS_LOCK:
+        previous = load_jobs().get(job["id"], {}).get("last_stats")
+    return previous if matches(previous) else None
+
+
+@_job_operation(exclusive=True)
+def finish_run(job, stats, cancel_event=None):
     """Keep an unfinished checkpoint; remove it only after every planned item settles."""
     with _job_lock(job["id"]):
         run_id = stats.get("run_id")
         record = load_resume(job) if run_id else None
-        if run_id:
-            previous = next((h for h in reversed(load_history())
-                             if h.get("run_id") == run_id and h.get("status") == "ok"), None)
+        request_id = stats.get("request_id")
+        if run_id or request_id:
+            previous = _previous_finish(job, run_id, request_id)
             if previous:
-                if record and record.get("run_id") == run_id:
+                if isinstance(cancel_event, _FinishControl):
+                    cancel_event.begin_commit()
+                if previous["status"] == "ok" and record and record.get("run_id") == run_id:
                     os.remove(resume_path(job))
+                    _RESUME_ID_CACHE.pop(job["id"], None)
+                _save_last_stats(job, previous)
                 return 200, previous
+        cancelled = bool(stats.get("cancelled") or (cancel_event and cancel_event.is_set()))
+        if run_id:
             if not record or record.get("run_id") != run_id:
                 return 409, "续传记录已变化，请刷新任务"
-            code, status = resume_status(job)
-            if code != 200:
-                return code, status
-            remaining = bool(status["plan"]["upload"] or status["plan"]["deleted"])
+            remaining = True
+            if not cancelled:
+                try:
+                    code, status = (resume_status(job, cancel_event=cancel_event) if cancel_event
+                                    else resume_status(job))
+                    if code != 200:
+                        return code, status
+                    remaining = bool(status["plan"]["upload"] or status["plan"]["deleted"])
+                except _FinishCancelled:
+                    cancelled = True
         else:
             remaining = False
-        cancelled = bool(stats.get("cancelled"))
+        cancelled = cancelled or bool(cancel_event and cancel_event.is_set())
         failed = int(stats.get("failed", 0))
         complete = not (remaining or cancelled or failed)
         pruned = 0
-        if stats.get("prune_excluded") and (not run_id or complete):
-            code, result = prune_excluded(job)
+        if stats.get("prune_excluded") and complete:
+            code, result = prune_excluded(job, cancel_event=cancel_event)
             pruned = result.get("removed", 0) if code == 200 else 0
+        # Serialize accepted cancellation with the start of the final commit.
+        # The decision lock is never held across history/config filesystem I/O.
+        late_cancel = (cancel_event.begin_commit() if isinstance(cancel_event, _FinishControl)
+                       else bool(cancel_event and cancel_event.is_set()))
+        cancelled = cancelled or late_cancel
+        complete = not (remaining or cancelled or failed)
         entry = {
             "job_id": job["id"], "job_name": job["name"],
             "ts": int(time.time()), "run_id": run_id,
+            "request_id": request_id,
             "uploaded": int(stats.get("uploaded", 0)),
             "uploaded_bytes": int(stats.get("uploaded_bytes", 0)),
             "skipped": int(stats.get("skipped", 0)),
@@ -593,20 +899,180 @@ def finish_run(job, stats):
             "pruned_excluded": pruned,
         }
         append_history(entry)
-        with _JOBS_LOCK:
-            jobs = load_jobs()
-            if job["id"] in jobs:
-                jobs[job["id"]]["last_run"] = entry["ts"]
-                jobs[job["id"]]["last_stats"] = entry
-                save_jobs(jobs)
+        _save_last_stats(job, entry)
         if run_id and complete:
             os.remove(resume_path(job))
+            _RESUME_ID_CACHE.pop(job["id"], None)
         return 200, entry
+
+
+def _save_last_stats(job, entry):
+    with _JOBS_LOCK:
+        jobs = load_jobs()
+        if job["id"] in jobs:
+            jobs[job["id"]]["last_run"] = entry["ts"]
+            jobs[job["id"]]["last_stats"] = entry
+            save_jobs(jobs)
+
+
+def _finish_path(job):
+    return os.path.join(job_dir(job["id"]), "finish-request.json")
+
+
+def _finish_reply(record):
+    if record["phase"] == "error":
+        return record["code"], record["error"]
+    out = {"phase": record["phase"], "request_id": record["request_id"]}
+    if record["phase"] == "done":
+        out["result"] = record["result"]
+    return 200, out
+
+
+def _start_finish_worker(job, path, record):
+    """Caller holds only the coordinator lock. Heavy checks run in one worker."""
+    if path in _FINISH_ACTIVE:
+        return
+    event = _FinishControl()
+    if record.get("cancelled"):
+        event.set()
+    _FINISH_ACTIVE[path] = (record["request_id"], event)
+
+    def work():
+        try:
+            code, data = finish_run(job, record["stats"], cancel_event=event,
+                                    expected_generation=record["stats"].get("generation"))
+        except Exception as error:
+            code, data = 500, "收尾失败，可重试：%s" % error
+        with _FINISH_LOCK:
+            try:
+                current = _load_json(path, None)
+                # A deleted task must not be recreated by an old worker.
+                if current and current["request_id"] == record["request_id"]:
+                    if code == 200:
+                        current.update(phase="done", result=data)
+                    else:
+                        current.update(phase="error", code=code, error=data)
+                    try:
+                        _save_json(path, current)
+                    except OSError as error:
+                        _FINISH_WRITE_ERRORS[path] = (record["request_id"],
+                            "无法保存收尾结果，请重试确认：%s" % error)
+            finally:
+                _FINISH_ACTIVE.pop(path, None)
+
+    try:
+        threading.Thread(target=work, daemon=True).start()
+    except Exception:
+        _FINISH_ACTIVE.pop(path, None)
+        raise
+
+
+def finish_async(job, stats):
+    request_id = stats.get("request_id")
+    if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        return 400, "缺少有效的收尾请求标识"
+    path = _finish_path(job)
+    with _FINISH_LOCK:
+        record = _load_json(path, None)
+        if record and record["request_id"] == request_id:
+            if record["stats"] != stats:
+                return 409, "收尾请求内容已变化"
+            _FINISH_WRITE_ERRORS.pop(path, None)
+            if record["phase"] == "error":
+                record["phase"] = "running"
+                _save_json(path, record)
+        else:
+            if record and record["phase"] == "running":
+                return 409, "已有收尾操作，请等待完成后继续"
+            _FINISH_WRITE_ERRORS.pop(path, None)
+            record = {"request_id": request_id, "stats": stats, "phase": "running"}
+            _save_json(path, record)
+        if record["phase"] == "running":
+            _start_finish_worker(job, path, record)
+        return _finish_reply(record)
+
+
+def finish_async_status(job, request_id, cancel=False):
+    path = _finish_path(job)
+    with _FINISH_LOCK:
+        failed_write = _FINISH_WRITE_ERRORS.get(path)
+        if failed_write and failed_write[0] == request_id:
+            return 500, failed_write[1]
+        record = _load_json(path, None)
+        if not record or record["request_id"] != request_id:
+            return 404, "没有对应的收尾记录"
+        accepted = False
+        if record["phase"] == "running":
+            if cancel:
+                def persist_cancel():
+                    record["cancelled"] = True
+                    _save_json(path, record)
+                active = _FINISH_ACTIVE.get(path)
+                if active:
+                    accepted = active[1].request_cancel(persist_cancel)
+                else:
+                    persist_cancel()
+                    accepted = True
+            # A persisted running intent with no worker means a process restart.
+            _start_finish_worker(job, path, record)
+        code, out = _finish_reply(record)
+        if cancel and code == 200:
+            out["cancel_accepted"] = accepted
+        return code, out
+
+
+def retry_finish(job, request_id):
+    """Reopened pages retry the stored identity and stats, never invent a run."""
+    with _FINISH_LOCK:
+        record = _load_json(_finish_path(job), None)
+        if not record or record["request_id"] != request_id:
+            return 404, "没有对应的收尾记录"
+        return finish_async(job, record["stats"])
+
+
+@_job_operation(exclusive=True)
+def _checked_resume(job):
+    return resume_status(job)
+
+
+def resume_check(job, request_id):
+    """Poll physical resume verification without holding a long HTTP request."""
+    if not isinstance(request_id, str) or not re.fullmatch(r"[0-9a-f]{32}", request_id):
+        return 400, "续传查询标识非法"
+    jid = job["id"]
+    with _FINISH_LOCK:
+        current = _RESUME_CHECKS.get(jid)
+        if current and current["request_id"] == request_id and current["phase"] == "error":
+            # Deliver the failure before retiring it. The next request can
+            # retry; clients still count this failure towards their budget.
+            _RESUME_CHECKS.pop(jid, None)
+            return _finish_reply(current)
+        if current is None or (current["request_id"] != request_id and current["phase"] != "running"):
+            current = {"request_id": request_id, "phase": "running"}
+            _RESUME_CHECKS[jid] = current
+
+            def work():
+                try:
+                    code, data = _checked_resume(job)
+                except Exception as error:
+                    code, data = 500, "读取续传记录失败：%s" % error
+                with _FINISH_LOCK:
+                    if code == 200:
+                        current.update(phase="done", result=data)
+                    else:
+                        current.update(phase="error", code=code, error=data)
+
+            try:
+                threading.Thread(target=work, daemon=True).start()
+            except Exception as error:
+                _RESUME_CHECKS.pop(jid, None)
+                return 500, "无法启动续传核对，请重试：%s" % error
+        return _finish_reply(current)
 
 
 # ── 备份逻辑 ────────────────────────────────────────────────
 
-def _disk_snapshot(dest_root, progress=None):
+def _disk_snapshot(dest_root, progress=None, directories=None):
     """一次遍历备份目录，返回 {相对路径: (大小, mtime毫秒)}。
     扫描比对用：避免对每个文件做 realpath + 逐级 lstat + isfile 的系统调用风暴。
     跳过清单镜像目录与传输中的 .part 文件；不跟随符号链接。
@@ -619,6 +1085,8 @@ def _disk_snapshot(dest_root, progress=None):
     for dirpath, dirnames, filenames in os.walk(root, followlinks=False):
         dirnames[:] = [d for d in dirnames if d != MIRROR_DIRNAME]
         relbase = os.path.relpath(dirpath, root)
+        if directories is not None and relbase != ".":
+            directories.add(relbase.replace(os.sep, "/"))
         for name in filenames:
             if name.endswith(PART_SUFFIX):
                 continue
@@ -668,8 +1136,8 @@ def build_plan_gates(job, body):
     confirm = bool(body.get("confirm", False))
     force = bool(body.get("force", False))
     prune = bool(body.get("prune_excluded", False))
-    if not isinstance(files, list) or not files:
-        return None, None, (400, "文件清单为空（请确认选择了有效目录）"), folder, False
+    if not isinstance(files, list):
+        return None, None, (400, "文件清单格式无效"), folder, False
 
     incoming = {}
     for f in files:
@@ -713,12 +1181,17 @@ def build_plan_gates(job, body):
     return incoming, manifest, None, folder, prune
 
 
+@_job_operation(exclusive=True, check=False)
 def _scan_worker(job, folder, incoming, manifest, prune=False):
     st = _SCAN_STATE[job["id"]]
     try:
+        current = load_jobs().get(job["id"])
+        if current is None or any(current.get(k) != job.get(k) for k in ("destination", "exclude", "pc_path")):
+            raise ValueError("任务配置已变化，请重新扫描")
         st["phase"] = "snapshot"
         compact_manifest(job)   # 使用前压实：合并点在比对前（崩溃/关窗口留下的日志在此收编）
-        snapshot = _disk_snapshot(job["destination"], st)
+        directories = set()
+        snapshot = _disk_snapshot(job["destination"], st, directories)
         st["phase"] = "matching"
 
         upload, skipped, repaired, adopted = [], 0, 0, 0
@@ -731,7 +1204,8 @@ def _scan_worker(job, folder, incoming, manifest, prune=False):
             # 会差 1（截断 vs 四舍五入 vs 浮点噪声），严格相等会把约 1/4
             # 文件误判为变更（踩过：12711 个假变更 + 单文件永久误判）
             unchanged = bool(me) and me.get("s") == s and abs(me.get("m", 0) - m) <= 1
-            if unchanged and disk is not None:
+            disk_matches = bool(disk is not None and disk[0] == s and abs(disk[1] - m) <= 1)
+            if unchanged and disk_matches:
                 skipped += 1
             elif (not me) and disk is not None:
                 # 认领：NAS 上已有同名且大小+修改时间一致的文件（别的途径同步来的），
@@ -745,8 +1219,8 @@ def _scan_worker(job, folder, incoming, manifest, prune=False):
                 else:
                     upload.append([rel, s])
             else:
-                if unchanged and disk is None:
-                    repaired += 1  # 清单说有、盘上没有（被手动删/损坏）→ 补传
+                if unchanged:
+                    repaired += 1  # 清单说有、盘上缺失或大小/mtime 不符 → 补传
                 upload.append([rel, s])
 
         upload.sort(key=lambda u: u[0])   # u = [rel, size]，按路径排序
@@ -756,6 +1230,7 @@ def _scan_worker(job, folder, incoming, manifest, prune=False):
         manifest_meta(job, folder)
         st["plan"] = {
             "scan_id": st["scan_id"],
+            "generation": _native_generation(job),
             "folder": folder,
             "total_files": len(incoming),
             "upload": upload,           # 紧凑二元组 [rel, size]，响应体积减半
@@ -766,6 +1241,8 @@ def _scan_worker(job, folder, incoming, manifest, prune=False):
             "deleted": sorted(rel for rel in manifest["files"] if rel not in incoming),
             "excluded_kept": len(manifest.get("excluded") or []),
             "prune_excluded": prune,
+            "type_archives": {rel: rel + "." + uuid.uuid4().hex[:8] + DEL_SUFFIX
+                              for rel, _ in upload if rel in directories},
         }
         st["phase"] = "done"
     except Exception as e:
@@ -773,6 +1250,7 @@ def _scan_worker(job, folder, incoming, manifest, prune=False):
         st["error"] = "%s: %s" % (type(e).__name__, e)[:300]
 
 
+@_job_operation(exclusive=True)
 def build_plan(job, body):
     """同步入口：门禁通过后启动后台比对线程。
     busy 检查必须先于门禁的破坏性副作用（reset/排除剔除），
@@ -781,13 +1259,26 @@ def build_plan(job, body):
         cur = _SCAN_STATE.get(job["id"])
         if cur and cur.get("phase") not in ("done", "error"):
             return 409, {"reason": "scan_busy", "message": "该任务正在比对中，请稍候"}
-        old_run = load_resume(job)
+        corrupt_resume = False
+        try:
+            old_run = load_resume(job)
+        except _ResumeCorrupt:
+            if not body.get("replace_resume"):
+                return 409, {"reason": "resume_corrupt",
+                             "message": "上次续传记录已损坏或格式不兼容，无法继续原计划。是否重新扫描？已有备份文件和未完成分块会保留。"}
+            old_run, corrupt_resume = None, True
         if old_run and not body.get("replace_resume"):
             return 409, {"reason": "resume_pending", "message": "有未完成备份，请选择继续或重新扫描"}
         incoming, manifest, err, folder, prune = build_plan_gates(job, body)
         if err is not None:
             return err
-        if old_run:
+        _rotate_native_generation(job)
+        if corrupt_resume:
+            # Keep the original bytes for recovery, only after all scan gates
+            # passed and old native attempts have been fenced out.
+            path = resume_path(job)
+            os.replace(path, path + ".corrupt-" + uuid.uuid4().hex)
+        elif old_run:
             os.remove(resume_path(job))
         _SCAN_STATE[job["id"]] = {
             "phase": "queued", "seen": 0, "total": len(incoming),
@@ -795,10 +1286,73 @@ def build_plan(job, body):
             "scan_id": uuid.uuid4().hex, "incoming": incoming,
             "destination": job["destination"], "exclude": list(job.get("exclude", [])),
         }
-        threading.Thread(target=_scan_worker, args=(job, folder, incoming, manifest, prune), daemon=True).start()
+        try:
+            threading.Thread(target=_scan_worker, args=(job, folder, incoming, manifest, prune), daemon=True).start()
+        except Exception as error:
+            _SCAN_STATE[job["id"]].update(phase="error", error="无法启动扫描，请重试：%s" % error)
+            raise
     return 200, {"started": True, "total": len(incoming)}
 
 
+def _part_record_path(job, rel):
+    path = safe_join(job_dir(job["id"]), "parts/" + hashlib.sha256(rel.encode("utf-8")).hexdigest() + ".json")
+    if path is None:
+        raise OSError("分块记录路径非法")
+    return path
+
+
+def _part_context(job):
+    # A rescan/source edit rotates generation; replacing a checkpoint changes
+    # run_id. Neither operation may inherit bytes from an older plan.
+    return dict(_native_context(job), job_id=job["id"], destination=job["destination"],
+                pc_path=job.get("pc_path", ""))
+
+
+def _load_part_record(job, rel):
+    try:
+        with open(_part_record_path(job, rel), "r", encoding="utf-8") as stream:
+            record = json.load(stream)
+    except FileNotFoundError:
+        return None
+    except ValueError:
+        return None
+    # Real I/O errors remain retryable and must not discard valid progress.
+    return record if isinstance(record, dict) and record.get("version") == 1 else None
+
+
+def _part_matches(job, rel, part, context=None):
+    try:
+        st = os.stat(part, follow_symlinks=False)
+    except FileNotFoundError:
+        return False
+    if not stat.S_ISREG(st.st_mode):
+        raise OSError("分块文件不是普通文件")
+    record = _load_part_record(job, rel)
+    if record is None:
+        return False
+    context = context if context is not None else _part_context(job)
+    return (all(record.get(k) == v for k, v in context.items())
+            and record.get("identity") == _published_identity(st))
+
+
+def _save_part_record(job, rel, part, context=None):
+    context = context if context is not None else _part_context(job)
+    _save_json(_part_record_path(job, rel), dict(context, version=1, path=rel,
+               identity=_published_identity(os.stat(part, follow_symlinks=False))))
+
+
+def _quarantine_part(job, rel, part):
+    name = hashlib.sha256(rel.encode("utf-8")).hexdigest() + "-" + uuid.uuid4().hex + PART_SUFFIX
+    archive = safe_join(job["destination"], MIRROR_DIRNAME + "/partial-recovery/" + name)
+    if archive is None:
+        raise OSError("分块隔离路径非法")
+    _mkdir_chowned(os.path.dirname(archive))
+    _save_json(archive + ".json", {"path": rel, "job_id": job["id"],
+                                 "previous": _load_part_record(job, rel)})
+    os.replace(part, archive)
+
+
+@_job_operation()
 def put_chunk(job, rel, offset, body):
     """分块写入 .part 文件（幂等：offset <= 当前大小时先截断回 offset 再写，
     网络中断重试同一块不会错位；offset > 当前大小说明客户端状态过期，拒绝）。"""
@@ -807,6 +1361,14 @@ def put_chunk(job, rel, offset, body):
         return 400, "非法路径"
     part = destf + PART_SUFFIX
     with _upload_lock(part):
+        context = _part_context(job)
+        exists = os.path.lexists(part)
+        matches = exists and _part_matches(job, rel, part, context)
+        if exists and not matches:
+            if offset:
+                return 409, {"reason": "part_stale", "part_size": 0,
+                             "message": "旧分块无法匹配当前备份计划，请从头上传该文件"}
+            _quarantine_part(job, rel, part)
         parent = os.path.dirname(destf)
         if not os.path.isdir(parent):
             _mkdir_chowned(parent)
@@ -818,17 +1380,400 @@ def put_chunk(job, rel, offset, body):
             f.truncate(offset)
             f.seek(offset)
             f.write(body)
+        _save_part_record(job, rel, part, context)
     return 200, {"path": rel, "part_size": offset + len(body)}
 
 
+@_job_operation()
 def part_size(job, rel):
     destf = safe_join(job["destination"], rel)
     if destf is None:
         return 400, "非法路径"
     part = destf + PART_SUFFIX
-    return 200, {"size": os.path.getsize(part) if os.path.isfile(part) else 0}
+    with _upload_lock(part):
+        return 200, {"size": os.path.getsize(part) if _part_matches(job, rel, part) else 0}
 
 
+@_job_operation()
+def mkdirs_for_job(job, rels):
+    """Validate the whole batch; never report success for silently omitted paths."""
+    if not isinstance(rels, list) or len(rels) > MKDIRS_BATCH_MAX:
+        return 400, "目录准备每批最多 %d 个文件" % MKDIRS_BATCH_MAX
+    parents = set()
+    for rel in rels:
+        path = safe_join(job["destination"], rel)
+        if path is None:
+            return 400, "目录准备包含非法路径"
+        parents.add(os.path.dirname(path))
+    made = 0
+    for parent in sorted(parents):
+        if _mkdir_chowned(parent):
+            made += 1
+    return 200, {"created": made, "processed": len(rels)}
+
+
+def _native_record_path(job, rel):
+    name = hashlib.sha256(rel.encode("utf-8")).hexdigest() + ".json"
+    return safe_join(job_dir(job["id"]), "native/" + name)
+
+
+def _native_paths(record):
+    token = record.get("token")
+    stamp = record.get("prepared_ms")
+    if (not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token)
+            or type(stamp) is not int or stamp < 0):
+        return None
+    temp_name = "pcb_%s.temptd_%d" % (token, stamp)
+    ready_name = "pcb_%s.ready" % token
+    temp = safe_join(USER_DATA_ROOT, ".temp_upload_dir/" + temp_name)
+    ready = safe_join(USER_DATA_ROOT, ".temp_upload_dir/" + ready_name)
+    if temp is None or ready is None:
+        return None
+    return {"temp_name": temp_name, "ready_name": ready_name, "temp": temp, "ready": ready}
+
+
+def _retire_native_upload(job, record):
+    """Persist ownership before superseding a token; never remove its bytes here."""
+    if (not isinstance(record, dict) or record.get("data_root") != USER_DATA_ROOT
+            or not validate_rel(record.get("p"))):
+        return  # Unprovable legacy data is not eligible for automatic deletion.
+    paths = _native_paths(record)
+    if paths is None:
+        return
+    if record.get("settled") and not any(os.path.lexists(paths[k]) for k in ("temp", "ready")):
+        return  # Completed uploads have no staging data to collect.
+    path = safe_join(DATA_DIR, "native-retired/" + record["token"] + ".json")
+    if path is None:
+        raise OSError("原生上传回收记录路径非法")
+    _save_json(path, dict(record, job_id=job["id"], retired_at=time.time()))
+
+
+def _retire_job_uploads(job):
+    directory = os.path.join(job_dir(job["id"]), "native")
+    if not os.path.isdir(directory):
+        return
+    with os.scandir(directory) as entries:
+        for entry in entries:
+            if entry.is_file(follow_symlinks=False) and entry.name.endswith(".json"):
+                with open(entry.path, encoding="utf-8") as stream:
+                    _retire_native_upload(job, json.load(stream))
+
+
+def cleanup_native_uploads(now=None):
+    """Collect only registered, obsolete tokens after both retirement and I/O grace.
+
+    No prefix-based sweep: unknown legacy files, current recovery tokens and
+    backups are never candidates. Run outside HTTP requests and the hot path.
+    """
+    now = time.time() if now is None else now
+    cutoff, removed = now - NATIVE_RETIRE_GRACE, 0
+    directory = safe_join(DATA_DIR, "native-retired")
+    if directory is None or not os.path.isdir(directory):
+        return 0
+    with _NATIVE_GC_LOCK, os.scandir(directory) as entries:
+        for entry in entries:
+            if not entry.is_file(follow_symlinks=False) or not re.fullmatch(r"[0-9a-f]{32}\.json", entry.name):
+                continue
+            try:
+                with open(entry.path, encoding="utf-8") as stream:
+                    record = json.load(stream)
+                if not isinstance(record, dict):
+                    continue
+                retired = record.get("retired_at")
+                jid, rel, token = record.get("job_id"), record.get("p"), record.get("token")
+                if (type(retired) not in (int, float) or not 0 <= retired <= cutoff
+                        or record.get("data_root") != USER_DATA_ROOT
+                        or not isinstance(token, str) or token + ".json" != entry.name
+                        or not isinstance(jid, str) or not re.fullmatch(r"[0-9a-f]{8}", jid)
+                        or not validate_rel(rel) or not isinstance(record.get("destination"), str)):
+                    continue
+                paths = _native_paths(record)
+                part = safe_join(record["destination"], rel + PART_SUFFIX)
+                state_path = _native_record_path({"id": jid}, rel)
+                if paths is None or part is None or state_path is None:
+                    continue
+                with _lifecycle(jid).permit(), _upload_lock(part):
+                    try:
+                        with open(state_path, encoding="utf-8") as stream:
+                            current = json.load(stream)
+                    except FileNotFoundError:
+                        current = {}
+                    if not isinstance(current, dict) or current.get("token") == record["token"]:
+                        continue
+                    candidates = []
+                    for path in (paths["temp"], paths["ready"]):
+                        try:
+                            st = os.stat(path, follow_symlinks=False)
+                        except FileNotFoundError:
+                            continue
+                        if not stat.S_ISREG(st.st_mode) or st.st_mtime > cutoff:
+                            break
+                        candidates.append((path, _published_identity(st)))
+                    else:
+                        # Recheck immediately before unlink; a late writer or
+                        # replacement restarts the grace period on the next pass.
+                        for path, identity in candidates:
+                            if _published_identity(os.stat(path, follow_symlinks=False)) != identity:
+                                break
+                            os.remove(path)
+                            removed += 1
+                        else:
+                            os.remove(entry.path)
+            except (OSError, ValueError, TypeError) as error:
+                # Retain the ledger on failure so the next pass can retry.
+                print("[pcbackup] native cleanup deferred %s: %s" % (entry.name, error), flush=True)
+    return removed
+
+
+def _native_gc_loop(stop):
+    while not stop.is_set():
+        try:
+            removed = cleanup_native_uploads()
+            if removed:
+                print("[pcbackup] collected %d obsolete native staging files" % removed, flush=True)
+        except Exception as error:
+            print("[pcbackup] native cleanup deferred: %s" % error, flush=True)
+        stop.wait(NATIVE_GC_INTERVAL)
+
+
+def _has_size(path, size):
+    return os.path.isfile(path) and os.path.getsize(path) == size
+
+
+def _file_matches(path, size, mtime):
+    """Validate completed data against the same size/mtime rule as a scan."""
+    try:
+        st = os.stat(path, follow_symlinks=False)
+        return (stat.S_ISREG(st.st_mode) and st.st_size == size
+                and abs(st.st_mtime_ns // 1000000 - mtime) <= 1)
+    except OSError:
+        return False
+
+
+def _committed_file_matches(job, rel, size, mtime):
+    entry = load_manifest(job)["files"].get(rel)
+    dest = safe_join(job["destination"], rel)
+    return bool(entry and size is not None and entry.get("s") == size
+                and entry.get("m") == mtime and dest and _file_matches(dest, size, mtime))
+
+
+def _rotate_native_generation(job):
+    _save_json(os.path.join(job_dir(job["id"]), "native-generation.json"), uuid.uuid4().hex)
+    _RESUME_ID_CACHE.pop(job["id"], None)
+
+
+def _native_generation(job):
+    """Small persistent request fence; never read the full pending plan."""
+    with _job_lock(job["id"]):
+        path = os.path.join(job_dir(job["id"]), "native-generation.json")
+        generation = _load_json(path, None)
+        if not generation:
+            _rotate_native_generation(job)
+            generation = _load_json(path, None)
+        return generation
+
+
+def _native_context(job):
+    with _job_lock(job["id"]):
+        return {"generation": _native_generation(job), "run_id": _resume_run_id(job)}
+
+
+def _published_identity(st):
+    return {"dev": st.st_dev, "ino": st.st_ino, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
+
+
+def _published_matches(record, dest):
+    identity = record.get("publishing")
+    if not identity:
+        return False
+    try:
+        st = os.stat(dest)
+        return stat.S_ISREG(st.st_mode) and identity == _published_identity(st)
+    except OSError:
+        return False
+
+
+@_job_operation()
+def prepare_native_upload(job, body):
+    """Keep an isolated native staging identity; the NAS owns the final rename."""
+    rel, size, mtime = body.get("p"), body.get("s"), body.get("m")
+    source = _clean_pc_path(body.get("source"))
+    if (not validate_rel(rel) or type(size) is not int or size < 0
+            or type(mtime) is not int or mtime < 0 or not source):
+        return 400, "原生上传文件信息非法"
+    dest = safe_join(job["destination"], rel)
+    part = safe_join(job["destination"], rel + PART_SUFFIX)
+    state_path = _native_record_path(job, rel)
+    if dest is None or part is None or state_path is None:
+        return 400, "原生上传路径非法"
+    identity = {"p": rel, "s": size, "m": mtime, "source": source,
+                "destination": job["destination"], "data_root": USER_DATA_ROOT}
+    context = _native_context(job)
+    if body.get("run_id", context["run_id"]) != context["run_id"]:
+        return 409, "续传记录已变化，请刷新任务"
+    with _upload_lock(part):
+        record = _load_json(state_path, {})
+        if not isinstance(record, dict):
+            record = {}
+        paths = _native_paths(record)
+        # Upgrade a v1 ready/settled attempt without retransmitting its data.
+        same = all(record.get(k) == v for k, v in identity.items()) and (
+            record.get("version") == 1 or all(record.get(k) == v for k, v in context.items()))
+        uploaded = bool(same and paths and (
+            _has_size(paths["ready"], size)
+            or (record.get("settled") and _has_size(paths["temp"], size))
+            or (record.get("finalized") and (
+                _has_size(part, size) or _committed_file_matches(job, rel, size, mtime)))
+            or _published_matches(record, dest)))
+        changed = False
+        previous = record
+        if not uploaded:
+            # An unacknowledged old PUT may still be running. Give a retry its own
+            # path and token so late callbacks cannot replace the newer attempt.
+            record = dict(identity, **context, version=2, token=uuid.uuid4().hex,
+                          prepared_ms=int(time.time() * 1000), settled=False, finalized=False)
+            paths = _native_paths(record)
+            changed = True
+        elif record.get("version") == 1:
+            record.update(context, version=2)
+            changed = True
+        if paths is None:
+            return 400, "原生上传临时目录非法"
+        _mkdir_chowned(os.path.dirname(dest))
+        _mkdir_chowned(os.path.dirname(paths["temp"]))
+        if os.stat(os.path.dirname(dest)).st_dev != os.stat(os.path.dirname(paths["temp"])).st_dev:
+            return 400, "原生上传目标需与用户数据目录位于同一文件系统，请使用浏览器选择文件夹"
+        if changed:
+            if not uploaded:
+                _retire_native_upload(job, previous)
+            _save_json(state_path, record)
+        return 200, {"token": record["token"], "temp_name": paths["temp_name"],
+                     "ready_name": paths["ready_name"], "uploaded": uploaded}
+
+
+@_job_operation()
+def complete_native_upload(job, body):
+    """Reconcile a terminal native attempt, including a full PUT whose MOVE failed."""
+    rel, token = body.get("p"), body.get("token")
+    if (not validate_rel(rel) or not isinstance(token, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", token)):
+        return 400, "原生上传标识非法"
+    state_path = _native_record_path(job, rel)
+    dest = safe_join(job["destination"], rel)
+    part = safe_join(job["destination"], rel + PART_SUFFIX)
+    if state_path is None or dest is None or part is None:
+        return 400, "原生上传路径非法"
+    # Keep the same lock order as commit_file: file, then manifest/job.
+    with _upload_lock(part):
+        record = _load_json(state_path, {})
+        if (not isinstance(record, dict) or record.get("token") != token
+                or record.get("destination") != job["destination"]
+                or record.get("data_root") != USER_DATA_ROOT
+                or any(record.get(k) != v for k, v in _native_context(job).items())):
+            return 409, "原生上传记录已变化，请重试"
+        paths = _native_paths(record)
+        if paths is None:
+            return 400, "原生上传临时目录非法"
+        size = record["s"]
+        record["settled"] = True
+        _save_json(state_path, record)
+        if (record.get("finalized") and (
+                _has_size(part, size) or _committed_file_matches(job, rel, size, record["m"]))) or (
+                _published_matches(record, dest) and _committed_file_matches(job, rel, size, record["m"])):
+            return 200, {"path": rel, "size": size}
+        stage = next((p for p in (paths["ready"], paths["temp"])
+                      if _has_size(p, size)), None)
+        if stage is None:
+            return 409, {"reason": "native_incomplete", "message": "原生上传数据不完整，可再次继续备份"}
+        _mkdir_chowned(os.path.dirname(dest))
+        with open(stage, "r+b") as f:
+            os.fsync(f.fileno())
+        _save_part_record(job, rel, stage)
+        os.replace(stage, part)
+        _try_chown(part)
+        record["finalized"] = True
+        _save_json(state_path, record)
+        return 200, {"path": rel, "size": size}
+
+
+@_job_operation()
+def finalize_native_upload(job, body):
+    """Publish a terminal native PUT once; retries reconcile the same inode.
+
+    The intent records the synced inode BEFORE rename. If the process dies
+    between rename and journal append, a retry can finish bookkeeping without
+    mistaking an older same-size destination for this attempt. This preserves
+    the existing durability contract; directory/journal group sync is separate.
+    """
+    rel, token = body.get("p"), body.get("token")
+    if not validate_rel(rel) or not isinstance(token, str) or not re.fullmatch(r"[0-9a-f]{32}", token):
+        return 400, "原生上传标识非法"
+    dest = safe_join(job["destination"], rel)
+    part = safe_join(job["destination"], rel + PART_SUFFIX)
+    state_path = _native_record_path(job, rel)
+    if dest is None or part is None or state_path is None:
+        return 400, "原生上传路径非法"
+    with _upload_lock(part):
+        record = _load_json(state_path, {})
+        if (not isinstance(record, dict) or record.get("token") != token
+                or record.get("p") != rel
+                or record.get("destination") != job["destination"]
+                or record.get("data_root") != USER_DATA_ROOT
+                or any(record.get(k) != v for k, v in _native_context(job).items())):
+            return 409, "原生上传记录已变化，请重试"
+        size, mtime = record["s"], record["m"]
+        if (record.get("finalized") and not os.path.isfile(part)
+                and _committed_file_matches(job, rel, size, mtime)):
+            # An interrupted v1.6.1 run may already have completed both old calls.
+            return 200, {"path": rel, "size": size, "committed": True}
+        if _published_matches(record, dest):
+            entry = load_manifest(job)["files"].get(rel, {})
+            if entry.get("native_token") == token and entry.get("s") == size and entry.get("m") == mtime:
+                return 200, {"path": rel, "size": size, "committed": True}
+        else:
+            paths = _native_paths(record)
+            if paths is None:
+                return 400, "原生上传临时目录非法"
+            candidates = [paths["ready"], paths["temp"]]
+            if record.get("finalized"):
+                candidates.append(part)  # v1.6.1 complete succeeded before upgrade
+            stage, fileobj, staged_stat = None, None, None
+            for candidate in candidates:
+                try:
+                    fd = os.open(candidate, os.O_RDWR | getattr(os, "O_NOFOLLOW", 0)
+                                 | getattr(os, "O_NONBLOCK", 0) | getattr(os, "O_BINARY", 0))
+                except FileNotFoundError:
+                    continue
+                f = os.fdopen(fd, "r+b")
+                try:
+                    st = os.fstat(f.fileno())
+                    if stat.S_ISREG(st.st_mode) and st.st_size == size:
+                        stage, fileobj, staged_stat = candidate, f, st
+                        break
+                except BaseException:
+                    f.close()
+                    raise
+                f.close()
+            if fileobj is None:
+                # Record terminal status only once; a partial PUT is never published.
+                if not record.get("settled"):
+                    record["settled"] = True
+                    _save_json(state_path, record)
+                return 409, {"reason": "native_incomplete", "message": "原生上传数据不完整，可再次继续备份"}
+            with fileobj as f:
+                _set_native_owner(f.fileno(), staged_stat)
+                # Set attributes before the sole file fsync, rather than after it.
+                os.utime(f.fileno() if os.utime in os.supports_fd else stage,
+                         ns=(mtime * 1000000, mtime * 1000000))
+                os.fsync(f.fileno())
+                record.update(settled=True, publishing=_published_identity(os.fstat(f.fileno())))
+                _save_json(state_path, record)
+            os.replace(stage, dest)
+        manifest_upsert(job, [(rel, {"s": size, "m": mtime, "t": int(time.time()), "native_token": token})])
+        return 200, {"path": rel, "size": size, "committed": True}
+
+
+@_job_operation()
 def commit_file(job, rel, size, mtime):
     """.part → 正式文件：原子替换、保留修改时间、记清单。"""
     destf = safe_join(job["destination"], rel)
@@ -837,7 +1782,11 @@ def commit_file(job, rel, size, mtime):
     part = destf + PART_SUFFIX
     with _upload_lock(part):
         if not os.path.isfile(part):
+            if _committed_file_matches(job, rel, size, mtime):
+                return 200, {"path": rel, "size": size}
             return 400, "分块数据不存在，请重新上传该文件"
+        if not _part_matches(job, rel, part):
+            return 409, {"reason": "part_stale", "message": "分块无法匹配当前备份计划，请重新上传该文件"}
         actual = os.path.getsize(part)
         if size is not None and actual != size:
             return 409, {"reason": "size_mismatch", "part_size": actual}
@@ -853,9 +1802,14 @@ def commit_file(job, rel, size, mtime):
         manifest_upsert(job, [(rel, {"s": size if size is not None else actual,
                                      "m": mtime if mtime else int(time.time() * 1000),
                                      "t": int(time.time())})])
+        try:
+            os.remove(_part_record_path(job, rel))
+        except OSError:
+            pass  # Stale metadata cannot authorize a different file/plan.
     return 200, {"path": rel, "size": actual}
 
 
+@_job_operation(exclusive=True)
 def tombstone(job, paths, mode="del"):
     """处理 PC 端已删除的文件。
     mode="del"（默认）：改名为 <原名>.del，数据保留；已有 .del 则覆盖为最新版本。
@@ -895,37 +1849,48 @@ def tombstone(job, paths, mode="del"):
     return 200, results
 
 
-def prune_excluded(job):
+@_job_operation(exclusive=True)
+def prune_excluded(job, cancel_event=None):
     """彻底删除因排除规则移出管理的备份文件（用户在界面显式触发，不可恢复）。"""
     with _job_lock(job["id"]):
         m = load_manifest(job)
         paths = list(m.get("excluded") or [])
         removed = 0
         for rel in paths:
+            if cancel_event is not None and cancel_event.is_set():
+                break
             destf = safe_join(job["destination"], rel)
             if destf and os.path.isfile(destf):
                 try:
                     os.remove(destf)
                     removed += 1
-                except OSError:
-                    pass
-        manifest_excl_clear(job)
-    _prune_empty_dirs(job["destination"], paths)
-    return 200, {"removed": removed, "total": len(paths)}
+                except FileNotFoundError:
+                    pass  # An already removed file is safe to retry.
+        cancelled = bool(cancel_event and cancel_event.is_set())
+        if not cancelled:
+            manifest_excl_clear(job)
+        # On cancellation keep the exclusion list, including already missing
+        # files. A later retry safely skips those and finishes remaining paths.
+    _prune_empty_dirs(job["destination"], paths, cancel_event=cancel_event)
+    return 200, {"removed": removed, "total": len(paths), "cancelled": cancelled}
 
 
-def _prune_empty_dirs(dest_root, rel_paths):
+def _prune_empty_dirs(dest_root, rel_paths, cancel_event=None):
     """删除 rel_paths 各级父目录中已变空的目录（深度优先，不触碰根目录）。"""
     root = os.path.realpath(dest_root)
     if not os.path.isdir(root) or not rel_paths:
         return
     dirs = set()
     for rel in rel_paths:
+        if cancel_event is not None and cancel_event.is_set():
+            return
         d = os.path.dirname(rel)
         while d:
             dirs.add(d)
             d = os.path.dirname(d)
     for d in sorted(dirs, key=len, reverse=True):
+        if cancel_event is not None and cancel_event.is_set():
+            return
         p = os.path.join(root, d.replace("/", os.sep))
         try:
             if os.path.isdir(p) and not os.listdir(p):
@@ -979,17 +1944,30 @@ def _resolve_dest(body):
 
 
 def _mkdir_chowned(dest):
-    """创建目录（含父级），并把新建的目录归还给插件用户。"""
+    """创建并归还目录；仅本调用实际创建目标目录时返回 True。"""
     if os.path.isdir(dest):
-        return
+        return False
     missing = []
     p = dest
     while not os.path.exists(p) and p not in ("/",):
         missing.append(p)
         p = os.path.dirname(p)
-    os.makedirs(dest, exist_ok=True)
-    for d in missing:
-        _try_chown(d)
+    if not missing:
+        if not os.path.isdir(dest):
+            raise NotADirectoryError(dest)
+        return False
+    created = False
+    for d in reversed(missing):
+        try:
+            os.mkdir(d)
+        except FileExistsError:
+            if not os.path.isdir(d):
+                raise
+        else:
+            _try_chown(d)
+            if d == dest:
+                created = True
+    return created
 
 
 # ── 任务管理 ────────────────────────────────────────────────
@@ -1038,12 +2016,28 @@ def create_job(body):
     return 200, {"id": jid}
 
 
+@_job_operation(exclusive=True)
 def update_job(jid, body):
     with _JOBS_LOCK:
         jobs = load_jobs()
         if jid not in jobs:
             return 404, "任务不存在"
         job = jobs[jid]
+        if "selection_session" in body or "selection_seq" in body:
+            session, seq = body.get("selection_session"), body.get("selection_seq")
+            if (not isinstance(session, str) or not re.fullmatch(r"[0-9a-f]{32}", session)
+                    or type(seq) is not int or not 0 < seq <= 9007199254740991):
+                return 400, "目录选择标识非法"
+            selections = _SOURCE_SELECTIONS.setdefault(jid, {})
+            if seq < selections.get(session, 0):
+                return 409, {"reason": "selection_stale", "message": "目录选择已被更新"}
+            # Fence earlier picks even if this confirmation needs a CAS retry.
+            selections[session] = seq
+        if "expected_pc_path" in body and body["expected_pc_path"] != job.get("pc_path", ""):
+            return 409, {"reason": "source_changed", "pc_path": job.get("pc_path", ""),
+                         "message": "备份来源已变化，请重新确认当前选择"}
+        old_job = dict(job)
+        old_identity = {k: job.get(k) for k in ("destination", "exclude", "pc_path")}
         if "name" in body and str(body["name"]).strip():
             job["name"] = str(body["name"]).strip()
         if "dest_sub" in body or "destination" in body:
@@ -1065,21 +2059,41 @@ def update_job(jid, body):
             if pc_path is None:
                 return 400, "pc_path 非法"
             job["pc_path"] = pc_path
-        save_jobs(jobs)
+        if any(job.get(k) != v for k, v in old_identity.items()):
+            # Fence before publishing config. A failed config write leaves the
+            # old config with revoked plans, rather than authorizing old writes
+            # against a newly published destination. Bind legacy plans first.
+            with _job_lock(jid):
+                try:
+                    record = load_resume(old_job)
+                except _ResumeCorrupt:
+                    # Selecting a PC source precedes scanning in the native UI.
+                    # Revoke old attempts but leave corrupt bytes untouched until
+                    # the user explicitly confirms replacement during the scan.
+                    record = None
+                _bind_legacy_resume(old_job, record, _native_generation(old_job))
+                _rotate_native_generation(job)
+            _MANIFEST_PATH_CACHE.pop(jid, None)
+        if job != old_job:
+            save_jobs(jobs)
     return 200, "ok"
 
 
+@_job_operation(exclusive=True)
 def delete_job(jid, purge):
+    # The lifecycle writer keeps this job stable. Retirement may write many
+    # records, so do it outside the shared configuration lock.
+    job = load_jobs().get(jid)
+    if job is None:
+        return 404, "任务不存在"
+    if purge and not job.get("purge_allowed", False):
+        return 400, "该备份目录并非由此任务新建，不能自动删除；任务未删除"
+    purge_dest = _canonical_dest(job["destination"]) if purge else None
+    if purge and purge_dest is None:
+        return 400, "备份目录不在允许范围内，任务未删除"
+    _retire_job_uploads(job)
     with _JOBS_LOCK:
         jobs = load_jobs()
-        job = jobs.get(jid)
-        if job is None:
-            return 404, "任务不存在"
-        if purge and not job.get("purge_allowed", False):
-            return 400, "该备份目录并非由此任务新建，不能自动删除；任务未删除"
-        purge_dest = _canonical_dest(job["destination"]) if purge else None
-        if purge and purge_dest is None:
-            return 400, "备份目录不在允许范围内，任务未删除"
         if purge:
             for other_id, other in jobs.items():
                 if other_id == jid:
@@ -1094,9 +2108,11 @@ def delete_job(jid, purge):
                     continue
         jobs.pop(jid)
         save_jobs(jobs)
+        _SOURCE_SELECTIONS.pop(jid, None)
     with _job_lock(jid):
         _MANIFEST_CACHE.pop(jid, None)
         _RUN_CURRENT.pop(jid, None)
+        _RESUME_ID_CACHE.pop(jid, None)
     import shutil
     shutil.rmtree(job_dir(jid), ignore_errors=True)
     if purge:
@@ -1106,25 +2122,40 @@ def delete_job(jid, purge):
 
 
 def job_summary(job):
-    m = load_manifest(job)
-    files = m.get("files", {})
-    total_bytes = sum(v.get("s", 0) for v in files.values())
-    return {
-        "id": job["id"], "name": job["name"], "destination": job["destination"],
-        "dest_sub": job.get("dest_sub", ""),
-        "exclude": job.get("exclude", []), "folder": m.get("folder", ""),
-        "pc_path": job.get("pc_path", ""),
-        "files": len(files), "bytes": total_bytes,
-        "last_run": job.get("last_run", 0), "last_stats": job.get("last_stats", {}),
-        "resume_available": load_resume(job) is not None,
-        "created": job.get("created", 0),
-    }
+    with _FINISH_LOCK:
+        intent = _load_json(_finish_path(job), None)
+        pending = intent["request_id"] if intent and intent.get("phase") == "running" else ""
+        check = _RESUME_CHECKS.get(job["id"])
+        resume_pending = check["request_id"] if check and check.get("phase") == "running" else ""
+    # Never wait behind a verifier, including one admitted after the above
+    # snapshot. Keep its exclusive lifecycle permit and manifest consistency.
+    lock = _job_lock(job["id"])
+    acquired = not (pending or resume_pending) and lock.acquire(blocking=False)
+    try:
+        m = load_manifest(job) if acquired else {"folder": job.get("folder", ""), "files": {}}
+        files = m.get("files", {})
+        total_bytes = sum(v.get("s", 0) for v in files.values())
+        return {
+            "id": job["id"], "name": job["name"], "destination": job["destination"],
+            "dest_sub": job.get("dest_sub", ""),
+            "exclude": job.get("exclude", []), "folder": m.get("folder", ""),
+            "pc_path": job.get("pc_path", ""),
+            "files": len(files), "bytes": total_bytes,
+            "last_run": job.get("last_run", 0), "last_stats": job.get("last_stats", {}),
+            "resume_available": bool(pending or resume_pending) or os.path.isfile(resume_path(job)),
+            "finish_pending": pending, "resume_check_pending": resume_pending,
+            "summary_pending": not acquired,
+            "created": job.get("created", 0),
+        }
+    finally:
+        if acquired:
+            lock.release()
 
 
 # ── HTTP ────────────────────────────────────────────────────
 
 class Handler(BaseHTTPRequestHandler):
-    server_version = "pcbackup/1.0"
+    server_version = "pcbackup/" + PLUGIN_VERSION
     protocol_version = "HTTP/1.1"
 
     def log_message(self, fmt, *args):
@@ -1205,11 +2236,11 @@ class Handler(BaseHTTPRequestHandler):
             parts = [unquote(p) for p in path.split("/") if p]
 
             if path == "/api/health":
-                self._ok({"status": "running", "version": "1.2.0", "plugin": "pcbackup"})
+                self._ok({"status": "running", "version": PLUGIN_VERSION, "plugin": "pcbackup"})
 
             elif path == "/api/config":
                 self._ok({"data_root": USER_DATA_ROOT, "del_suffix": DEL_SUFFIX,
-                          "version": "1.2.0"})
+                          "version": PLUGIN_VERSION})
 
             elif path == "/api/jobs":
                 self._ok([job_summary(j) for j in load_jobs().values()])
@@ -1237,7 +2268,14 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "resume":
                 job = self._job(parts[2]) or None
                 if job:
-                    code, data = resume_status(job)
+                    code, data = (resume_check(job, q.get("request_id")) if q.get("async") == "1"
+                                  else resume_status(job))
+                    (self._ok if code == 200 else lambda d: self._err(code, d))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "finish-status":
+                job = self._job(parts[2]) or None
+                if job:
+                    code, data = finish_async_status(job, q.get("request_id"))
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)
 
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "part":
@@ -1246,7 +2284,7 @@ class Handler(BaseHTTPRequestHandler):
                     if "path" not in q:
                         self._err(400, "缺少 path 参数")
                     else:
-                        code, data = part_size(job, q["path"])
+                        code, data = part_size(job, q["path"], expected_generation=q.get("generation"))
                         (self._ok if code == 200 else lambda d: self._err(code, d))(data)
 
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "history":
@@ -1314,7 +2352,40 @@ class Handler(BaseHTTPRequestHandler):
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "resume":
                 job = self._job(parts[2]) or None
                 if job:
-                    code, data = start_resume(job, self._read_json())
+                    body = self._read_json()
+                    code, data = start_resume(job, body, expected_generation=body.get("generation"))
+                    (self._ok if code == 200 else lambda d: self._err(code, d))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "mkdirs":
+                job = self._job(parts[2]) or None
+                if job:
+                    body = self._read_json()
+                    code, data = mkdirs_for_job(job, body.get("paths", []),
+                                               expected_generation=body.get("generation"))
+                    (self._ok if code == 200 else lambda d: self._err(code, data))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "prepare-paths":
+                job = self._job(parts[2]) or None
+                if job:
+                    body = self._read_json()
+                    code, data = prepare_type_conflicts(job, body.get("run_id"),
+                                                       expected_generation=body.get("generation"))
+                    (self._ok if code == 200 else lambda d: self._err(code, d))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "native-upload":
+                job = self._job(parts[2]) or None
+                if job:
+                    body = self._read_json()
+                    action = body.get("action")
+                    if action == "prepare":
+                        code, data = prepare_native_upload(job, body,
+                                                           expected_generation=body.get("generation"))
+                    elif action == "complete":
+                        code, data = complete_native_upload(job, body)
+                    elif action == "finalize":
+                        code, data = finalize_native_upload(job, body)
+                    else:
+                        code, data = 400, "原生上传操作非法"
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)
 
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "commit":
@@ -1322,7 +2393,8 @@ class Handler(BaseHTTPRequestHandler):
                 if job:
                     body = self._read_json()
                     code, data = commit_file(job, body.get("p", ""),
-                                             body.get("s"), body.get("m"))
+                                             body.get("s"), body.get("m"),
+                                             expected_generation=body.get("generation"))
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)
 
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "prune-excluded":
@@ -1336,17 +2408,36 @@ class Handler(BaseHTTPRequestHandler):
                 if job:
                     body = self._read_json()
                     code, data = tombstone(job, body.get("paths", []),
-                                           "delete" if body.get("mode") == "delete" else "del")
+                                           "delete" if body.get("mode") == "delete" else "del",
+                                           expected_generation=body.get("generation"))
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)
 
             elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "finish":
                 job = self._job(parts[2]) or None
                 if job:
-                    code, data = finish_run(job, self._read_json())
+                    body = self._read_json()
+                    code, data = (finish_async(job, body) if body.get("async") is True
+                                  else finish_run(job, body, expected_generation=body.get("generation")))
+                    (self._ok if code == 200 else lambda d: self._err(code, d))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "finish-cancel":
+                job = self._job(parts[2]) or None
+                if job:
+                    body = self._read_json()
+                    code, data = finish_async_status(job, body.get("request_id"), cancel=True)
+                    (self._ok if code == 200 else lambda d: self._err(code, d))(data)
+
+            elif len(parts) == 4 and parts[1] == "jobs" and parts[3] == "finish-retry":
+                job = self._job(parts[2]) or None
+                if job:
+                    body = self._read_json()
+                    code, data = retry_finish(job, body.get("request_id"))
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)
 
             else:
                 self._err(404, "not found")
+        except (BrokenPipeError, ConnectionResetError):
+            pass
         except (ValueError, KeyError) as e:
             self._err(400, "请求格式错误: %s" % e)
         except Exception as e:
@@ -1366,7 +2457,8 @@ class Handler(BaseHTTPRequestHandler):
                         self._err(400, "offset 非法")
                         return
                     body = self._read_body()
-                    code, data = put_chunk(job, q.get("path", ""), offset, body)
+                    code, data = put_chunk(job, q.get("path", ""), offset, body,
+                                          expected_generation=q.get("generation"))
                     (self._ok if code == 200 else lambda d: self._err(code, d))(data)
             else:
                 self._err(404, "not found")
@@ -1409,6 +2501,11 @@ def main():
     os.makedirs(DATA_DIR, exist_ok=True)
     os.makedirs(JOBS_DIR, exist_ok=True)
     server = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    stop_gc = threading.Event()
+    try:
+        threading.Thread(target=_native_gc_loop, args=(stop_gc,), daemon=True).start()
+    except Exception as error:
+        print("[pcbackup] cannot start native cleanup: %s" % error, flush=True)
     print("[pcbackup] listening on 127.0.0.1:%d  data=%s" % (PORT, DATA_DIR))
     sys.stdout.flush()
     try:
@@ -1416,6 +2513,7 @@ def main():
     except KeyboardInterrupt:
         pass
     finally:
+        stop_gc.set()
         server.server_close()
 
 

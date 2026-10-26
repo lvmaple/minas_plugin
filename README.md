@@ -8,7 +8,7 @@
 | --- | --- | --- |
 | Docker 控制台（`dockerctl`） | 管理容器、镜像、存储卷和网络，支持部署容器 | [README](xiaomi-nas-plugin-dockerctl/README.md) |
 | Motrix 下载（`motrix`） | 通过 Motrix Server 管理下载任务 | [README](xiaomi-nas-plugin-motrix/README.md) |
-| PC 备份（`pcbackup`） | 将电脑目录增量备份到 NAS，支持断点续传 | [README](xiaomi-nas-plugin-pcbackup/README.md) |
+| PC 备份（`pcbackup`） | v1.6.4：目录增量备份、原生直传及断点恢复；上传 6 并发、目录准备 2 批并发 | [README](xiaomi-nas-plugin-pcbackup/README.md) |
 | 系统状态（`sysmon`） | 查看 CPU、内存、磁盘、温度、风扇和 Docker 状态 | [README](xiaomi-nas-plugin-sysmon/README.md) |
 
 ## SSH 开启工具
