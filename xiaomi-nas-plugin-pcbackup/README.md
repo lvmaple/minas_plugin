@@ -150,7 +150,7 @@ ssh root@<NAS_IP> "sh /tmp/_pcbackup_pkg/deploy/deploy.sh <NAS_UID>"
 python -X utf8 deploy-plugins.py --select pcbackup --channel socat
 ```
 
-连接信息与客户端证书配置见[统一部署说明](../DEPLOY-PLUGINS.md)。部署会重启后端服务，应在备份任务空闲时执行。升级前保留旧程序、`INFO`、注册条目及开机恢复副本，保留现有 `etc/` 配置、清单、续传记录和备份数据。升级后确认 `/api/health` 的版本、`INFO` 和注册版本一致，`index.html` 引用 `app.js?v=1.6.4`，并重新打开插件加载新前端。
+连接信息与客户端证书配置见[统一部署说明](../DEPLOY-PLUGINS.md)。部署会重启后端服务，应在备份任务空闲时执行。升级前保留旧程序、`INFO`、注册条目及开机恢复副本，保留现有运行状态目录（迁移前为插件 `etc/`，迁移后为 `/data/backup/plugins/pcbackup/state/`）和备份数据。程序回滚也应继续使用当前持久状态目录，避免用旧 `etc/` 快照覆盖最新任务和断点。升级后确认 `/api/health` 的版本、`INFO` 和注册版本一致，`index.html` 引用 `app.js?v=1.6.4`，并重新打开插件加载新前端。
 
 部署脚本会自动完成规范里所有关键步骤：www 软链指向 `src/ui`、图标放
 `/data/plugin/www/icon/pcbackup.icon`、`.list` 的 `frontend.url` 用数组 + hash 路由、
