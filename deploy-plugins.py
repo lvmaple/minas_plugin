@@ -10,6 +10,7 @@
 
 import argparse
 import base64
+import http.client
 import json
 import os
 import re
@@ -309,6 +310,7 @@ class SocatClient:
 
     # ---- 命令执行：base64 分块下发（规避 PTY 行缓冲限制） ----
     def run_command(self, script, timeout=60):
+        script = script.replace("\r\n", "\n")
         b64 = base64.b64encode(script.encode()).decode()
         host = self.connection.host
         port = self.connection.shell_port
@@ -320,10 +322,11 @@ class SocatClient:
             if len(b64) <= 200:
                 feed = (f"printf 'echo {b64} | base64 -d | bash\\nexit\\n' | timeout {timeout} nc {host} {port}")
             else:
-                chunks = [b64[i:i + 100] for i in range(0, len(b64), 100)]
-                lines = ["rm -f /tmp/dp.b64"] + [f"echo -n {c} >> /tmp/dp.b64" for c in chunks] + \
-                        ["base64 -d /tmp/dp.b64 > /tmp/dp.sh; tr -d '\\r' < /tmp/dp.sh > /tmp/dp2.sh; "
-                         f"bash /tmp/dp2.sh; rm -f /tmp/dp.b64 /tmp/dp.sh /tmp/dp2.sh",
+                chunks = [b64[i:i + 56] for i in range(0, len(b64), 56)]
+                # 输入已统一为 LF；不再用 tr 改写解码后的脚本正文。
+                lines = ["sleep 0.4", "rm -f /tmp/dp.b64"] + [f"echo -n {c} >> /tmp/dp.b64" for c in chunks] + \
+                        [f"base64 -d /tmp/dp.b64 > /tmp/dp.sh; bash /tmp/dp.sh; "
+                         f"rm -f /tmp/dp.b64 /tmp/dp.sh",
                          "exit"]
                 feed = "printf '" + "\\n".join(lines) + f"' | timeout {timeout} nc {host} {port}"
             result = subprocess.run(wrapper + ["bash", "-c", feed], text=True,
@@ -331,7 +334,7 @@ class SocatClient:
                                     capture_output=True, timeout=timeout + 30)
             return self._strip_noise(result.stdout)
         # POSIX：直接管道
-        chunks = [b64[i:i + 100] for i in range(0, len(b64), 100)]
+        chunks = [b64[i:i + 56] for i in range(0, len(b64), 56)]
         lines = ["rm -f /tmp/dp.b64"] + [f"echo -n {c} >> /tmp/dp.b64" for c in chunks] + \
                 ["base64 -d /tmp/dp.b64 | bash", "exit"]
         command = "printf '" + "\\n".join(lines) + f"' | timeout {timeout} nc {host} {port}"
@@ -365,25 +368,19 @@ class SocatClient:
         if self._webdav_auth is not None:
             return self._webdav_auth
         request = json.dumps({"selector": ["webDAV"]}).encode()
-        raw = socket.create_connection((self.connection.host, 443), timeout=10)
-        s = self.ctx.wrap_socket(raw, server_hostname=self.server_cn)
-        s.sendall(("POST /cgi-bin/luci/filemgr/get_pool_info HTTP/1.1\r\nHost: n\r\n"
-                   "Connection: close\r\nContent-Type: application/json\r\n"
-                   f"Content-Length: {len(request)}\r\n\r\n").encode() + request)
-        chunks = []
-        s.settimeout(10)
-        while True:
-            try:
-                data = s.recv(65536)
-            except Exception:
-                break
-            if not data:
-                break
-            chunks.append(data)
-        s.close()
-        response = b"".join(chunks).decode("utf-8", "replace")
         try:
-            body = json.loads(response.split("\r\n\r\n", 1)[1])
+            with socket.create_connection((self.connection.host, 443), timeout=10) as raw:
+                with self.ctx.wrap_socket(raw, server_hostname=self.server_cn) as stream:
+                    stream.settimeout(10)
+                    stream.sendall(("POST /cgi-bin/luci/filemgr/get_pool_info HTTP/1.1\r\nHost: n\r\n"
+                                    "Connection: close\r\nContent-Type: application/json\r\n"
+                                    f"Content-Length: {len(request)}\r\n\r\n").encode() + request)
+                    # Let the standard parser handle framing before JSON decoding.
+                    with http.client.HTTPResponse(stream) as response:
+                        response.begin()
+                        if not 200 <= response.status < 300:
+                            raise ValueError("HTTP %s" % response.status)
+                        body = json.load(response)
             webdav = body["data"]["webDAV"]
             cred = f"{webdav['username']}:{webdav['password']}"
             self._webdav_auth = "Basic " + base64.b64encode(cred.encode()).decode()
@@ -546,7 +543,12 @@ def _deploy_via_socat(plugin, connection, client, archive):
     # 上传走 WebDAV（/pool0/data = /home/u<uid>/pool0/data），执行走 root shell
     staging = f"/pool0/data/.deploy_staging-{plugin.plugin_id}"
     home_stage = f"/home/u{connection.uid}/pool0/data/.deploy_staging-{plugin.plugin_id}"
-    client.run_command(f"mkdir -p {home_stage}", timeout=20)
+    # WebDAV 以 u<uid> 身份写入；米家 UID 与系统 UID 不同，按用户名设置属主。
+    client.run_command(
+        f"mkdir -p {shlex.quote(home_stage)} && "
+        f"chown u{connection.uid}:u{connection.uid} {shlex.quote(home_stage)} && "
+        f"chmod 755 {shlex.quote(home_stage)}",
+        timeout=20)
     client.upload(archive, f"{staging}/{plugin.plugin_id}.zip")
     print(f"==> 已上传 {plugin.plugin_id}.zip（WebDAV 通道）")
     source = f"{home_stage}/package"
