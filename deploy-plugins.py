@@ -278,15 +278,25 @@ class SocatClient:
         for path, what in ((self.key, "私钥"), (self.ca, "CA 链")):
             if not path.is_file():
                 raise ValueError(f"证书目录缺少{what}：{path}")
-        # 服务器 CN 形如 nas.<uid>.<did>.<n>——从证书里解析
-        der = base64.b64decode(b"".join(
-            self.cert.read_bytes().splitlines()[1:-1]))
-        match = re.search(rb"nas\.[0-9]+\.[0-9a-f]+\.[0-9]+", der)
-        if not match:
-            raise ValueError("无法从证书解析服务器 CN")
-        self.server_cn = match.group(0).decode()
+        # Client and server CN suffixes rotate independently. Discover the
+        # server name through a CA-verified handshake, then enable name checks
+        # for all subsequent connections. Do not fall back after TLS failure.
         self.ctx = ssl.create_default_context(cafile=str(self.ca))
         self.ctx.load_cert_chain(str(self.cert), str(self.key))
+        self.ctx.check_hostname = False
+        try:
+            with socket.create_connection((connection.host, 443), timeout=10) as raw:
+                with self.ctx.wrap_socket(raw, server_hostname="n") as stream:
+                    peer = stream.getpeercert()
+        except OSError as error:
+            raise ValueError("NAS TLS 证书探测失败，请检查地址、证书和连接: %s" % error) from error
+        finally:
+            self.ctx.check_hostname = True
+        server_cn = next((value for rdn in peer.get("subject", ())
+                          for name, value in rdn if name == "commonName"), None)
+        if not server_cn:
+            raise ValueError("NAS 服务器证书缺少 commonName")
+        self.server_cn = server_cn
         self._webdav_auth = None
 
     # ---- 通道探测 ----

@@ -11,6 +11,8 @@
 
 `--channel auto`（默认）：Windows 上选 socat，其他平台选 ssh。socat 通道前置条件：NAS 上已开启 socat root shell（2323 端口，开启方式见工具包 `xiaomi-nas-root-tool-1.0.9.462/` 内文档）；本机存在桌面端生成的 mTLS 客户端证书（`minasCert` 目录，自动搜索，可用 `--cert-dir` 指定）。
 
+socat 初始化时通过本地 CA 校验 TLS 证书链，再从服务端证书读取当前名称；仅这次探测关闭主机名匹配，正式连接同时校验证书链和主机名。证书不可信或连接失败会明确报错，不再静默猜测客户端证书中的名称。该探测不上传或安装插件。
+
 ## 配置
 
 可将 `deploy-config.example.json` 复制为 `deploy-config.json` 并填写：

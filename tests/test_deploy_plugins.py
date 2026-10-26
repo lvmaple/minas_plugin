@@ -1,12 +1,17 @@
 import importlib.util
 import json
+import shutil
+import socket
+import ssl
+import subprocess
 import sys
 import tempfile
+import threading
 import unittest
 import zipfile
 from argparse import Namespace
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 
 SCRIPT = Path(__file__).resolve().parents[1] / "deploy-plugins.py"
@@ -100,8 +105,173 @@ class DeployPluginsTests(unittest.TestCase):
     def test_make_client_picks_socat_or_ssh(self):
         ssh_conn = deploy.Connection("nas", "1", "root", 22, None, "native", "ssh")
         socat_conn = deploy.Connection("nas", "1", "root", 22, None, "native", "socat")
-        self.assertIsInstance(deploy.make_client(ssh_conn), deploy.SshClient)
-        self.assertIsInstance(deploy.make_client(socat_conn), deploy.SocatClient)
+        with patch.object(deploy, 'SshClient') as ssh, patch.object(deploy, 'SocatClient') as socat:
+            self.assertIs(deploy.make_client(ssh_conn), ssh.return_value)
+            ssh.assert_called_once_with(ssh_conn)
+            socat.assert_not_called()
+            self.assertIs(deploy.make_client(socat_conn), socat.return_value)
+            socat.assert_called_once_with(socat_conn)
+
+
+class SocatTlsTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='deploy-tls-')
+        self.addCleanup(temp.cleanup)
+        self.cert_dir = Path(temp.name)
+        for name in ('123_test_cert.pem', '123_test_private_key.pem', 'ca_chain.pem'):
+            (self.cert_dir / name).touch()
+        self.peer = {'subject': ((('commonName', 'nas.123.server.2'),),)}
+        self.handshakes = []
+        owner = self
+
+        class Context:
+            def __init__(self, *args):
+                self.verify_mode = ssl.CERT_REQUIRED
+                self.check_hostname = True
+                self.load_cert_chain = MagicMock()
+
+            def wrap_socket(self, raw, server_hostname):
+                owner.handshakes.append((self.verify_mode, self.check_hostname, server_hostname))
+                if owner.tls_error:
+                    raise owner.tls_error
+                stream = MagicMock()
+                stream.__enter__.return_value = stream
+                stream.getpeercert.side_effect = lambda binary_form=False: b'test-peer' if binary_form else owner.peer
+                return stream
+
+        self.tls_error = None
+        self.verified = Context()
+        for target, kwargs in (
+            ('find_cert_dir', {'return_value': self.cert_dir}),
+            ('socket.create_connection', {'return_value': MagicMock()}),
+            ('ssl.SSLContext', {'side_effect': Context}),
+            ('ssl.create_default_context', {'return_value': self.verified}),
+            ('ssl._ssl._test_decode_cert', {'return_value': self.peer}),
+        ):
+            mock = patch('deploy_plugins.' + target, **kwargs)
+            value = mock.start()
+            self.addCleanup(mock.stop)
+            if target == 'ssl.create_default_context':
+                self.context_factory = value
+            if target == 'socket.create_connection':
+                self.connect = value
+        self.connection = deploy.Connection('nas.example.test', '123', 'root', 22, None, 'native', 'socat')
+
+    def test_probe_verifies_chain_and_formal_connections_verify_hostname(self):
+        client = deploy.SocatClient(self.connection)
+        self.assertEqual(client.server_cn, 'nas.123.server.2')
+        self.assertTrue(self.handshakes)
+        self.assertTrue(all(mode == ssl.CERT_REQUIRED and not hostname for mode, hostname, _ in self.handshakes))
+        self.assertTrue(client.ctx.check_hostname)
+        self.assertEqual(client.ctx.verify_mode, ssl.CERT_REQUIRED)
+        self.context_factory.assert_called_once_with(cafile=str(self.cert_dir / 'ca_chain.pem'))
+        self.verified.load_cert_chain.assert_called_once_with(
+            str(self.cert_dir / '123_test_cert.pem'), str(self.cert_dir / '123_test_private_key.pem'))
+
+    def test_untrusted_peer_is_rejected_without_local_certificate_fallback(self):
+        self.tls_error = ssl.SSLCertVerificationError('untrusted test peer')
+        with self.assertRaises(ValueError) as caught:
+            deploy.SocatClient(self.connection)
+        self.assertIs(caught.exception.__cause__, self.tls_error)
+        self.assertTrue(self.verified.check_hostname)
+
+    def test_unreachable_probe_reports_failure_instead_of_silently_selecting_a_cn(self):
+        error = OSError('test connection refused')
+        self.connect.side_effect = error
+        with self.assertRaises(ValueError) as caught:
+            deploy.SocatClient(self.connection)
+        self.assertIs(caught.exception.__cause__, error)
+
+
+@unittest.skipUnless(shutil.which('openssl'), 'OpenSSL generates temporary test certificates')
+class SocatTlsIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        temp = tempfile.TemporaryDirectory(prefix='deploy-real-tls-')
+        self.addCleanup(temp.cleanup)
+        self.root = Path(temp.name)
+        self.assertEqual(self.root.resolve().parent, Path(tempfile.gettempdir()).resolve())
+
+        def openssl(*args):
+            subprocess.run(['openssl', *args], cwd=self.root, check=True,
+                           capture_output=True, timeout=15)
+
+        openssl('req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+                '-subj', '/CN=Deployment-Test-CA', '-keyout', 'ca.key', '-out', 'ca_chain.pem')
+        for name, cn, usage in [('server', 'nas.123.server.2', 'serverAuth'),
+                                ('123_test', 'nas.123.client.1', 'clientAuth')]:
+            openssl('req', '-new', '-newkey', 'rsa:2048', '-nodes', '-subj', '/CN=' + cn,
+                    '-keyout', name + '_private_key.pem', '-out', name + '.csr')
+            ext = self.root / (name + '.ext')
+            ext.write_text('extendedKeyUsage=' + usage + '\nsubjectAltName=DNS:' + cn + '\n')
+            openssl('x509', '-req', '-in', name + '.csr', '-CA', 'ca_chain.pem', '-CAkey', 'ca.key',
+                    '-CAcreateserial', '-days', '1', '-extfile', ext.name, '-out', name + '_cert.pem')
+
+    def server(self, trusted=True):
+        cert, key = self.root / 'server_cert.pem', self.root / 'server_private_key.pem'
+        if not trusted:
+            cert, key = self.root / 'untrusted.pem', self.root / 'untrusted.key'
+            subprocess.run(['openssl', 'req', '-x509', '-newkey', 'rsa:2048', '-nodes', '-days', '1',
+                            '-subj', '/CN=nas.123.server.2', '-keyout', str(key), '-out', str(cert)],
+                           check=True, capture_output=True, timeout=15)
+        context = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        context.load_cert_chain(str(cert), str(key))
+        context.load_verify_locations(cafile=str(self.root / 'ca_chain.pem'))
+        context.verify_mode = ssl.CERT_REQUIRED
+        listener = socket.socket()
+        listener.bind(('127.0.0.1', 0))
+        listener.listen()
+        listener.settimeout(.1)
+        address = listener.getsockname()
+        stop = threading.Event()
+
+        def serve():
+            while not stop.is_set():
+                try:
+                    raw, _ = listener.accept()
+                except socket.timeout:
+                    continue
+                except OSError:
+                    break
+                try:
+                    raw.settimeout(2)
+                    with context.wrap_socket(raw, server_side=True) as stream:
+                        stream.sendall(b'ok')
+                except (ssl.SSLError, OSError):
+                    raw.close()
+
+        worker = threading.Thread(target=serve, daemon=True)
+        worker.start()
+
+        def cleanup():
+            stop.set()
+            listener.close()
+            worker.join(3)
+
+        self.addCleanup(cleanup)
+        return address
+
+    def test_rotated_server_name_works_with_real_ca_and_mutual_tls(self):
+        address = self.server()
+        connect = socket.create_connection
+        connection = deploy.Connection('nas.example.test', '123', 'root', 22, None, 'native', 'socat')
+        with patch.object(deploy, 'find_cert_dir', return_value=self.root), \
+                patch.object(deploy.socket, 'create_connection', side_effect=lambda *a, **kw: connect(address, timeout=3)):
+            client = deploy.SocatClient(connection)
+        self.assertEqual(client.server_cn, 'nas.123.server.2')
+        self.assertTrue(client.ctx.check_hostname)
+        with connect(address, timeout=3) as raw:
+            with client.ctx.wrap_socket(raw, server_hostname=client.server_cn) as stream:
+                self.assertEqual(stream.recv(2), b'ok')
+
+    def test_real_untrusted_server_is_rejected_during_probe(self):
+        address = self.server(trusted=False)
+        connect = socket.create_connection
+        connection = deploy.Connection('nas.example.test', '123', 'root', 22, None, 'native', 'socat')
+        with patch.object(deploy, 'find_cert_dir', return_value=self.root), \
+                patch.object(deploy.socket, 'create_connection', side_effect=lambda *a, **kw: connect(address, timeout=3)):
+            with self.assertRaises(ValueError) as caught:
+                deploy.SocatClient(connection)
+        self.assertIsInstance(caught.exception.__cause__, ssl.SSLCertVerificationError)
 
 
 if __name__ == "__main__":

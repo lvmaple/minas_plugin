@@ -174,6 +174,8 @@ ConditionPathExists=$BACKUP_DIR/restore.sh
 [Service]
 Type=oneshot
 TimeoutStartSec=180
+Restart=on-failure
+RestartSec=5
 ExecStart=/bin/sh $BACKUP_DIR/restore.sh $UID_NUM
 
 [Install]

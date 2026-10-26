@@ -23,6 +23,11 @@ javascript_files = [
     if not path.name.startswith(("window-chrome-motrix-", "ws-hook"))
 ]
 files = [root / "index.html", *javascript_files, *root.glob("assets/*.css")]
+socket_chunk = "window-chrome-CZCTzY6z.js"
+socket_path = root / "assets" / socket_chunk
+if not socket_path.is_file():
+    raise SystemExit("Motrix assets are already patched or incomplete; copy the original web assets before patching")
+patched = {}
 origin_marker = "globalThis.location?.origin??``"
 origin_replacements = 0
 socket_marker = "let e=`${this.baseUrl.replace(/^http/,`ws`)}/rpc/events`"
@@ -145,23 +150,20 @@ for path in files:
         rem_replacements += count
     for old in ("/assets/", "/favicon.ico", "/apple-touch-icon.png", "/app-icon.png", "/mo-logo.svg", "/xiaomi-theme.css"):
         content = content.replace(old, prefix + old)
-    path.write_text(content, encoding="utf-8")
+    patched[path] = content
 
 # The NAS app keeps its JavaScript realm alive when a plugin window closes.
 # Give this patched chunk a content-derived URL so a reopened plugin cannot
 # reuse the old module instance from that realm's module map.
-socket_chunk = "window-chrome-CZCTzY6z.js"
-socket_path = root / "assets" / socket_chunk
-socket_digest = hashlib.sha256(socket_path.read_bytes()).hexdigest()[:12]
+socket_digest = hashlib.sha256(patched[socket_path].encode("utf-8")).hexdigest()[:12]
 socket_new_name = f"window-chrome-motrix-{socket_digest}.js"
 chunk_reference_replacements = 0
 for path in files:
     if path == socket_path:
         continue
-    content = path.read_text(encoding="utf-8")
+    content = patched[path]
     chunk_reference_replacements += content.count(socket_chunk)
-    path.write_text(content.replace(socket_chunk, socket_new_name), encoding="utf-8")
-socket_path.rename(socket_path.with_name(socket_new_name))
+    patched[path] = content.replace(socket_chunk, socket_new_name)
 
 if origin_replacements != 3:
     raise SystemExit(f"Expected three Motrix API origins, found {origin_replacements}")
@@ -183,3 +185,9 @@ if locale_bootstrap_replacements != 1:
     raise SystemExit(f"Expected one locale bootstrap hook, found {locale_bootstrap_replacements}")
 if locale_save_replacements != 1:
     raise SystemExit(f"Expected one locale save hook, found {locale_save_replacements}")
+
+# Validate the complete transformation before touching the supplied directory.
+# A failed check or an accidental repeat must leave working assets intact.
+for path, content in patched.items():
+    path.write_text(content, encoding="utf-8", newline="\n")
+socket_path.replace(socket_path.with_name(socket_new_name))
