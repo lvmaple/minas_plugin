@@ -178,6 +178,19 @@ cp -a "${HOME_DIR}" "${BACKUP_DIR}/${PLUGIN}"
 echo "  ③ 安装开机自愈服务 ${PLUGIN}-restore.service"
 cat > "${BACKUP_DIR}/restore.sh" <<'RST'
 #!/bin/sh
+set -e
+# All plugins share .list and nginx configuration. Serialize only boot recovery.
+if [ "${MINAS_PLUGIN_RESTORE_LOCKED:-0}" != 1 ]; then
+    exec python3 - "$0" "$@" <<'PYLOCK'
+import fcntl, os, subprocess, sys
+os.makedirs("/run/lock", exist_ok=True)
+with open("/run/lock/minas-plugin-restore.lock", "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    result = subprocess.run(["/bin/sh", *sys.argv[1:]],
+                            env=dict(os.environ, MINAS_PLUGIN_RESTORE_LOCKED="1"))
+    sys.exit(result.returncode)
+PYLOCK
+fi
 # dockerctl 开机自愈：系统重启会清掉手动插件目录与 .list，从 /data 备份恢复
 UID_N=__DEPLOY_UID__
 PLUGIN=dockerctl
@@ -224,7 +237,7 @@ fi
 
 # 4) systemd unit + 启动服务
 if [ -f "${HOME_DIR}/scripts/control" ]; then
-    PLUG_SRC_DIR="${HOME_DIR}/src" PLUG_HOME_DIR="${HOME_DIR}" PLUG_USER="${USER_NAME}" \
+    PLUG_SKIP_SERVICE_START=1 PLUG_SRC_DIR="${HOME_DIR}/src" PLUG_HOME_DIR="${HOME_DIR}" PLUG_USER="${USER_NAME}" \
       PLUG_PORT_ALLOC="${PORT}" sh "${HOME_DIR}/scripts/control" postinstall
 fi
 
@@ -266,6 +279,7 @@ print("restore: nginx location 已注入")
 PY3
     nginx -t && nginx -s reload || echo "restore: nginx reload 失败（稍后可手动 reload）"
 fi
+systemctl --no-block start "${PLUGIN}.service"
 exit 0
 RST
 sed -i "s/^UID_N=__DEPLOY_UID__$/UID_N=${UID_NUM}/" "${BACKUP_DIR}/restore.sh"

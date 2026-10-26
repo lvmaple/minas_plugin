@@ -44,7 +44,7 @@
        │  HTTPS /plugin/<uid>/pcbackup/api/...（nginx 反代）
        ▼
 后端服务 src/files/httpd.py（NAS 上 systemd 常驻，127.0.0.1:9303）
-  ├─ 清单库 etc/jobs/<id>/manifest.json（每个文件的大小+修改时间）
+  ├─ 清单库 /data/backup/plugins/pcbackup/state/jobs/<id>/manifest.json（每个文件的大小+修改时间）
   ├─ 增量计划：比对「本次选择的文件」与「清单库」
   ├─ 上传落盘：原生临时文件 / 浏览器 xxx.pcbp.part → 原子改名为正式文件
   └─ 删除标记：正式文件 → <原名>.del
@@ -186,6 +186,10 @@ nginx 规则插在 `location /plugin` **之前**，并带 `client_max_body_size 
 | ② | 源码整体备份到 `/data/backup/plugins/pcbackup/`（/data 分区重启不丢） |
 | ③ | `pcbackup-restore.service` 开机自愈：自动恢复插件目录、www 软链、图标、`.list` 注册、systemd 单元并启动服务、nginx 反代 |
 
+运行状态独立保存在 `/data/backup/plugins/pcbackup/state/`，包括任务配置、历史、清单日志、续传计划、分块记录、原生上传身份和收尾回执。首次更新时先停止旧服务，将旧插件 `etc/` 完整复制到临时目录，成功后才发布为状态目录；原 `etc/` 保留。复制失败不会发布半份状态，修复原因后可以重试。状态目录已经存在时始终使用它，不会被源码快照里的旧 `etc/` 覆盖。开发环境直接运行后端时仍可通过 `PCBACKUP_DATA` 指定目录。
+
+开机恢复只生成业务服务配置，最后异步排入启动任务，避免与 `Before=pcbackup.service` 互相等待。四个插件的恢复脚本共用恢复锁，串行合并插件列表和 Nginx 配置；该锁不参与正常备份、上传和收尾。上传仍为 6 并发，目录准备仍为 2 批并发，逐文件刷盘方式不变。
+
 即使极端情况下全部丢失，备份数据与清单也不受影响：
 - 清单双写在备份数据目录（`<数据根>/.pcbackup/manifest.json`），插件目录被清时自动恢复
 - 两份清单都没了也能靠"认领"（同名 + 大小 + 修改时间一致）从 NAS 现存文件重建
@@ -208,9 +212,12 @@ curl -s http://127.0.0.1:9303/api/health
 
 ```powershell
 python -X utf8 -m unittest discover -s tests -p 'test_pcbackup*.py' -v
+python -X utf8 -m unittest discover -s tests -p test_plugin_persistence.py -v
 node --test tests/test_pcbackup_native_reader.js tests/test_pcbackup_upload.js
 python -X utf8 tests/benchmark_pcbackup_context.py --require-fast-path
 ```
+
+持久化 Shell 回归需在 Linux/WSL 运行，只操作临时 NAS 目录和命令替身，覆盖开机启动顺序、迁移失败重试、目录丢失后保留任务及 5 万文件续传计划、四插件同时恢复。Windows 会跳过这些 Shell 用例；本地验证不代表已部署或完成实机重启验证。
 
 性能基准在隔离目录中生成 2 条与 50000 条的真实续传计划，使用 6 个线程比较冷读、重复校验、新上传和正常增量修改。它检查热路径不读取完整计划、普通修改不产生无数据可回收的登记，并记录耗时；临时文件写入模拟数据到达，不代表桌面 App 的实际上传吞吐。
 

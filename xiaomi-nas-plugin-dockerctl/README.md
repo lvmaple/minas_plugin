@@ -25,6 +25,8 @@ PLUG_PORT=9302 DOCKER_BIN=$(which docker) python3 httpd.py
 
 详见 [DEPLOY.md](./DEPLOY.md)
 
+开机恢复会先恢复入口与服务配置，再异步启动业务服务，避免恢复服务与业务服务互相等待。恢复过程与其他三个插件共用锁，防止同时覆盖插件列表和 Nginx 配置；该锁不参与正常 Docker 操作。Compose 项目继续保存在 `/data/backup/plugins/dockerctl/compose`。
+
 ## 目录结构
 
 ```
