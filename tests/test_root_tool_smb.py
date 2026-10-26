@@ -1,9 +1,11 @@
 """Offline SMB regressions. No certificates, sockets, NAS, or root payloads are used."""
 import copy
+import hashlib
 import importlib.util
 import io
 import json
 import os
+import re
 from contextlib import redirect_stdout
 from pathlib import Path
 import shlex
@@ -115,10 +117,12 @@ class RootToolSmbTests(unittest.TestCase):
         with patch.object(tool, "Nas", return_value=nas), \
              patch.object(tool, "find_cert_dir", return_value="offline-certs"), \
              patch.object(tool, "ssh_key_path", side_effect=SetupComplete), \
+             patch.object(tool, "_cleanup_via_shell") as cleanup, \
              patch.object(tool.time, "sleep"), \
              patch.object(tool.socket, "create_connection", side_effect=AssertionError("Network forbidden")), \
              patch.object(tool.subprocess, "run", side_effect=AssertionError("Subprocess forbidden")), \
              patch("sys.argv", [str(SCRIPT), nas.ip, *args]), redirect_stdout(output):
+            self.last_cleanup = cleanup
             try:
                 tool.main()
             except SetupComplete:
@@ -283,6 +287,7 @@ class RootToolSmbTests(unittest.TestCase):
                      patch.object(tool, "ssh_key_path", return_value="offline-key"), \
                      patch.object(tool, "build_trigger_so"), \
                      patch.object(tool.os.path, "getsize", return_value=0), \
+                     patch.object(tool, "_smb_read_file", return_value=None), \
                      patch.object(tool, "_smb_write_file") as write, \
                      patch.object(tool, "tcp_open", return_value=True), \
                      patch.object(tool, "_cleanup_via_shell") as cleanup, \
@@ -296,10 +301,115 @@ class RootToolSmbTests(unittest.TestCase):
                                     for call in write.call_args_list))
                 cleanup.assert_called_once()
                 command = cleanup.call_args.args[1]
+                self.assertIn("rm -f /etc/ld.so.preload", command)
                 self.assertIn("uci delete sambauser.u10001_" + expected_id, command)
                 other_id = "2" if expected_id == "1" else "1"
                 self.assertNotIn("uci delete sambauser.u10001_" + other_id, command)
                 self.assert_preserved(nas, originals)
+
+    def test_main_with_existing_preload_backs_up_and_cleans_with_restore(self):
+        nas = OfflineNas()
+        with patch.object(tool, "Nas", return_value=nas), \
+             patch.object(tool, "find_cert_dir", return_value="offline-certs"), \
+             patch.object(tool, "ssh_key_path", return_value="offline-key"), \
+             patch.object(tool, "build_trigger_so"), \
+             patch.object(tool.os.path, "getsize", return_value=0), \
+             patch.object(tool, "_smb_read_file",
+                          side_effect=[b"/vendor/preload.so\n", b"/vendor/preload.so\n"]) as read, \
+             patch.object(tool, "_smb_write_file") as write, \
+             patch.object(tool, "tcp_open", return_value=True), \
+             patch.object(tool, "_cleanup_via_shell") as cleanup, \
+             patch.object(tool.socket, "create_connection", side_effect=AssertionError("Network forbidden")), \
+             patch.object(tool.subprocess, "run", side_effect=AssertionError("Subprocess forbidden")), \
+             patch("builtins.open", mock_open(read_data="offline-public-key")), \
+             patch("sys.argv", [str(SCRIPT), nas.ip]), redirect_stdout(io.StringIO()):
+            tool.main()
+        self.assertEqual(read.call_count, 2)
+        self.assertEqual(write.call_count, 4)
+        names = [call.args[1] for call in write.call_args_list]
+        self.assertTrue(names[0].startswith("ld.so.preload.bak-"), names)
+        self.assertEqual(names[1:], [".rootpwn.sh", "pwn.so", "ld.so.preload"])
+        self.assertEqual(write.call_args_list[0].args[2], b"/vendor/preload.so\n")
+        payload = write.call_args_list[1].args[2].decode()
+        self.assertTrue(payload.startswith("#!/bin/sh\nif [ -f /etc/%s ]" % names[0]), payload[:120])
+        self.assertIn("mv -f /etc/%s /etc/ld.so.preload" % names[0], payload)
+        command = cleanup.call_args.args[1]
+        self.assertIn("mv -f /etc/%s /etc/ld.so.preload" % names[0], command)
+        self.assertNotIn("rm -f /etc/ld.so.preload /etc/pwn.so", command)
+
+    def test_main_aborts_without_arming_when_preload_state_unknown(self):
+        nas = OfflineNas()
+        with patch.object(tool, "Nas", return_value=nas), \
+             patch.object(tool, "find_cert_dir", return_value="offline-certs"), \
+             patch.object(tool, "ssh_key_path", return_value="offline-key"), \
+             patch.object(tool, "build_trigger_so"), \
+             patch.object(tool.os.path, "getsize", return_value=0), \
+             patch.object(tool, "_smb_read_file", side_effect=OSError("share auth failed")), \
+             patch.object(tool, "_smb_write_file") as write, \
+             patch.object(tool, "_cleanup_via_shell") as cleanup, \
+             patch.object(tool.socket, "create_connection", side_effect=AssertionError("Network forbidden")), \
+             patch.object(tool.subprocess, "run", side_effect=AssertionError("Subprocess forbidden")), \
+             patch("builtins.open", mock_open(read_data="offline-public-key")), \
+             patch("sys.argv", [str(SCRIPT), nas.ip]), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                tool.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(write.call_count, 0)
+        cleanup.assert_called_once()
+        self.assertNotIn("ld.so.preload", cleanup.call_args.args[1])
+
+    def test_setup_failure_after_add_attempts_cleanup_and_discloses_password(self):
+        nas = OfflineNas()
+        nas.add_code = 2512
+        ready, output = self.run_setup(nas)
+        self.assertFalse(ready, output)
+        self.last_cleanup.assert_called_once()
+        command = self.last_cleanup.call_args.args[1]
+        self.assertIn("uci delete sambauser.u10001_1", command)
+        self.assertNotIn("uci delete sambauser.u10001_2", command)
+        # 步骤②失败清理绝不触碰 /etc 下的文件（本阶段 payload 从未写入）
+        self.assertNotIn("ld.so.preload", command)
+        self.assertNotIn("pwn.so", command)
+        match = re.search(r"口令[^:]*: (Rp![A-Za-z0-9_-]+)", output)
+        self.assertIsNotNone(match, output)
+        password = match.group(1)
+        self.assertIn(hashlib.sha256(password.encode()).hexdigest(), command)
+        self.assertNotIn(password, command)
+
+    def test_setup_failure_after_verified_add_uses_readback_slot(self):
+        nas = OfflineNas()
+        nas.persist_set = False
+        ready, output = self.run_setup(nas)
+        self.assertFalse(ready, output)
+        self.last_cleanup.assert_called_once()
+        command = self.last_cleanup.call_args.args[1]
+        self.assertIn("uci delete sambauser.u10001_1", command)
+        match = re.search(r"口令[^:]*: (Rp![A-Za-z0-9_-]+)", output)
+        self.assertIn(hashlib.sha256(match.group(1).encode()).hexdigest(), command)
+
+    def test_staging_only_failure_cleans_directory_without_account_operations(self):
+        original = account(1)
+        nas = OfflineNas([original])
+
+        def change_after_snapshot(nas):
+            if nas.account_reads == 2:
+                nas.accounts["1"]["share_dir"] = ["/user/changed/share"]
+
+        nas.on_read = change_after_snapshot
+        ready, output = self.run_setup(nas)
+        self.assertFalse(ready, output)
+        self.last_cleanup.assert_called_once()
+        command = self.last_cleanup.call_args.args[1]
+        self.assertTrue(command.startswith("rm -rf "), command)
+        self.assertIn("/home/u10001/pool0/data/", command)
+        self.assertNotIn("uci ", command)
+        self.assertIn("CLEAN_OK", command)
+
+    def test_pre_add_failures_do_not_invoke_cleanup(self):
+        originals = [account(1, "first-user"), account(2, "second-user")]
+        nas = OfflineNas(originals)
+        self.assertFalse(self.run_setup(nas)[0])
+        self.last_cleanup.assert_not_called()
 
 
 class RootToolCleanupTests(unittest.TestCase):
@@ -313,10 +423,66 @@ class RootToolCleanupTests(unittest.TestCase):
         else:
             raise unittest.SkipTest("POSIX shell needed for offline cleanup sandbox")
 
-    def cleanup_command(self, id):
-        return tool._disarm_command("10001", "unique-staging", id, "temporary-password")
+    def cleanup_command(self, id, preload="keep", bak=None):
+        return tool._disarm_command("10001", "unique-staging", id, "temporary-password",
+                                    preload, bak)
 
-    def run_cleanup(self, id, changes=None):
+    def sandbox(self, command, values, preload_override=None):
+        """在本地 POSIX shell 沙箱执行真实生成的清理命令。uci get 从 values 取值，
+        其余 uci/rm/sed/nas/systemctl 打桩，sed 指向临时 passwd/shadow 夹具。"""
+        cases = "\n".join("%s) printf '%%s\\n' %s ;;" % (shlex.quote(key), shlex.quote(value))
+                          for key, value in values.items())
+        stubs = ""
+        if preload_override is not None:
+            # restore 模式：cat/mv/rm 打桩（/etc 路径不能真动，结果记入 ops）
+            stubs = ("cat() { printf '%%s' %s; }\n"
+                     "mv() { printf 'mv %%s\\n' \"$*\" >> \"$diag_root/ops\"; }\n"
+                     % shlex.quote(preload_override))
+        script = '''
+set -eu
+diag_root=$(mktemp -d /tmp/minas-smb-cleanup.XXXXXXXX)
+trap 'command rm -rf -- "$diag_root"' EXIT
+printf '%s\\n' 'sambau10001:x:1700:1700::/tmp:/bin/false' \\
+  'sambau100010:x:1701:1701::/tmp:/bin/false' \\
+  'prefixsambau10001:x:1702:1702::/tmp:/bin/false' \\
+  'original-user:x:1703:1703::/tmp:/bin/false' > "$diag_root/passwd"
+cp "$diag_root/passwd" "$diag_root/shadow"
+: > "$diag_root/deletes"
+: > "$diag_root/ops"
+''' + stubs + '''
+uci() {
+  if [ "$1" = '-q' ]; then shift; fi
+  case "$1" in
+    get) case "$2" in
+''' + cases + '''
+      *) return 1 ;;
+    esac ;;
+    delete) printf '%s\\n' "$2" >> "$diag_root/deletes" ;;
+    commit) : ;;
+    *) return 1 ;;
+  esac
+}
+rm() { printf '%s\\n' "$*" >> "$diag_root/ops"; :; }
+sed() { command sed -i "$2" "$diag_root/passwd" "$diag_root/shadow"; }
+nas() { :; }
+systemctl() { :; }
+''' + command + '''
+printf '\\nDELETES\\n'
+command cat "$diag_root/deletes"
+printf 'PASSWD\\n'
+command cat "$diag_root/passwd" 2>/dev/null || true
+printf 'SHADOW\\n'
+command cat "$diag_root/shadow" 2>/dev/null || true
+printf 'OPS\\n'
+command cat "$diag_root/ops"
+'''
+        # Bytes retain LF on Windows; text-mode stdin would translate it to CRLF.
+        result = subprocess.run(self.shell, input=script.encode("utf-8"),
+                                capture_output=True, timeout=15)
+        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
+        return result.stdout.decode("utf-8")
+
+    def run_cleanup(self, id, changes=None, preload="keep"):
         section = "u10001_" + id
         values = {
             "sambauser." + section + ".id": id,
@@ -332,49 +498,23 @@ class RootToolCleanupTests(unittest.TestCase):
         }
         if changes:
             values.update(changes)
-        cases = "\n".join("%s) printf '%%s\\n' %s ;;" % (shlex.quote(key), shlex.quote(value))
-                          for key, value in values.items())
-        # Execute the REAL generated shell command. All NAS/system mutations are
-        # functions; sed is redirected to disposable passwd/shadow fixtures.
-        script = '''
-set -eu
-diag_root=$(mktemp -d /tmp/minas-smb-cleanup.XXXXXXXX)
-trap 'command rm -rf -- "$diag_root"' EXIT
-printf '%s\\n' 'sambau10001:x:1700:1700::/tmp:/bin/false' \\
-  'sambau100010:x:1701:1701::/tmp:/bin/false' \\
-  'prefixsambau10001:x:1702:1702::/tmp:/bin/false' \\
-  'original-user:x:1703:1703::/tmp:/bin/false' > "$diag_root/passwd"
-cp "$diag_root/passwd" "$diag_root/shadow"
-: > "$diag_root/deletes"
-uci() {
-  if [ "$1" = '-q' ]; then shift; fi
-  case "$1" in
-    get) case "$2" in
-''' + cases + '''
-      *) return 1 ;;
-    esac ;;
-    delete) printf '%s\\n' "$2" >> "$diag_root/deletes" ;;
-    commit) : ;;
-    *) return 1 ;;
-  esac
-}
-rm() { :; }
-sed() { command sed -i "$2" "$diag_root/passwd" "$diag_root/shadow"; }
-nas() { :; }
-systemctl() { :; }
-''' + self.cleanup_command(id) + '''
-printf '\\nDELETES\\n'
-cat "$diag_root/deletes"
-printf 'PASSWD\\n'
-cat "$diag_root/passwd"
-printf 'SHADOW\\n'
-cat "$diag_root/shadow"
-'''
-        # Bytes retain LF on Windows; text-mode stdin would translate it to CRLF.
-        result = subprocess.run(self.shell, input=script.encode("utf-8"),
-                                capture_output=True, timeout=15)
-        self.assertEqual(result.returncode, 0, result.stderr.decode("utf-8", "replace"))
-        return result.stdout.decode("utf-8")
+        command = self.cleanup_command(id, preload=preload,
+                                       bak="ld.so.preload.bak-1a2b3c4d" if preload == "restore" else None)
+        return self.sandbox(command, values,
+                            preload_override="/vendor/orig.so" if preload == "restore" else None)
+
+    def run_setup_cleanup(self, changes=None):
+        section = "u10001_1"
+        values = {
+            "sambauser." + section + ".id": "1",
+            "sambauser." + section + ".user": USER,
+            "sambauser." + section + ".name": USER,
+            "sambauser." + section + ".passwd": "temporary-password",
+        }
+        if changes:
+            values.update(changes)
+        return self.sandbox(tool._disarm_setup(
+            "10001", "unique-staging", "1", "temporary-password"), values)
 
     def test_cleanup_only_deletes_actual_created_slot_and_exact_system_username(self):
         for id in ("1", "2"):
@@ -408,6 +548,121 @@ cat "$diag_root/shadow"
                 self.assertEqual(output.split("DELETES\n")[1].split("PASSWD\n")[0], "")
                 self.assertEqual(sum(line.startswith("sambau10001:")
                                      for line in output.splitlines()), 2)
+
+    def test_disarm_preload_modes(self):
+        keep = self.cleanup_command("1")
+        self.assertNotIn("ld.so.preload", keep)
+        self.assertIn("rm -f /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log", keep)
+        remove = self.cleanup_command("1", preload="remove")
+        self.assertIn("rm -f /etc/ld.so.preload /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log",
+                      remove)
+        restore = self.cleanup_command("1", preload="restore", bak="ld.so.preload.bak-1a2b3c4d")
+        self.assertIn("mv -f /etc/ld.so.preload.bak-1a2b3c4d /etc/ld.so.preload", restore)
+        self.assertIn("= '/etc/pwn.so' ]", restore)
+        with self.assertRaises(ValueError):
+            tool._disarm_command("10001", "unique-staging", "1", "temporary-password", "restore")
+
+    def test_restore_disarm_keeps_restored_original_preload(self):
+        # 备份已被消费（[ -f bak ] 为假）且当前内容是原厂 preload：不允许 rm
+        output = self.run_cleanup("1", preload="restore")
+        self.assertIn("CLEAN_OK", output)
+        ops = output.split("OPS\n")[1]
+        self.assertNotIn("mv ", ops)
+        for line in ops.splitlines():
+            self.assertNotEqual(line, "-f /etc/ld.so.preload", ops)
+        self.assertIn("-f /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log", ops)
+
+    def test_restore_disarm_removes_preload_when_still_armed(self):
+        # 备份不存在且当前内容仍是本工具布防标记：删除布防
+        section = "u10001_1"
+        values = {
+            "sambauser." + section + ".id": "1",
+            "sambauser." + section + ".user": USER,
+            "sambauser." + section + ".name": USER,
+            "sambauser." + section + ".passwd": "temporary-password",
+            "sambauser." + section + ".dirs": "/etc",
+            "sambauser." + section + ".status": "1",
+            "sambashare." + section + ".name": "etc-10001",
+            "sambashare." + section + ".path": "/etc",
+            "sambashare." + section + ".users": "sambau10001",
+            "sambashare." + section + ".user_force": "root",
+        }
+        output = self.sandbox(self.cleanup_command("1", preload="restore",
+                                                   bak="ld.so.preload.bak-1a2b3c4d"),
+                              values, preload_override="/etc/pwn.so")
+        self.assertIn("CLEAN_OK", output)
+        ops = output.split("OPS\n")[1]
+        self.assertIn("-f /etc/ld.so.preload", ops.splitlines())
+
+    def test_setup_disarm_anchored_on_sambauser_only(self):
+        # sambashare path/name 状态未知（set 未确认）：不核对也要能清（CLEAN_OK）
+        output = self.run_setup_cleanup()
+        self.assertIn("CLEAN_OK", output)
+        deletes = output.split("DELETES\n")[1].split("PASSWD\n")[0].splitlines()
+        self.assertEqual(deletes, ["sambashare.u10001_1", "sambauser.u10001_1"])
+        records = output.split("PASSWD\n")[1]
+        self.assertNotIn("\nsambau10001:", "\n" + records)
+        self.assertIn("\noriginal-user:", "\n" + records)
+
+    def test_setup_disarm_skips_foreign_or_missing_records(self):
+        for changes in ({"sambauser.u10001_1.passwd": "user-changed-password"},
+                        {"sambauser.u10001_1.user": "u20002"},
+                        {"sambauser.u10001_1.id": "2"},
+                        {"sambauser.u10001_1.name": "other-name"}):
+            with self.subTest(changes=changes):
+                output = self.run_setup_cleanup(changes)
+                self.assertIn("SMB_CLEAN_SKIP", output)
+                self.assertNotIn("CLEAN_OK", output)
+                self.assertEqual(output.split("DELETES\n")[1].split("PASSWD\n")[0], "")
+                self.assertEqual(sum(line.startswith("sambau10001:")
+                                     for line in output.splitlines()), 2)
+
+    def test_setup_disarm_never_touches_etc_files(self):
+        command = tool._disarm_setup("10001", "unique-staging", "1", "temporary-password")
+        self.assertNotIn("ld.so.preload", command)
+        self.assertNotIn("pwn.so", command)
+        self.assertNotIn(".rootpwn", command)
+        self.assertTrue(command.startswith("rm -rf "))
+
+
+class PayloadAndReadHelperTests(unittest.TestCase):
+    def test_payload_without_backup_removes_preload(self):
+        script = tool._payload_script("ssh-ed25519 AAAA minas-root", 2323, None)
+        self.assertEqual(script.splitlines()[1], "rm -f /etc/ld.so.preload")
+        self.assertIn("ssh-ed25519 AAAA minas-root", script)
+        self.assertIn("TCP-LISTEN:2323", script)
+
+    def test_payload_with_backup_restores_it_before_anything_else(self):
+        script = tool._payload_script("ssh-ed25519 AAAA minas-root", 2323,
+                                      "ld.so.preload.bak-1a2b3c4d")
+        lines = script.splitlines()
+        self.assertTrue(lines[1].startswith("if [ -f /etc/ld.so.preload.bak-1a2b3c4d ]"), lines[1])
+        self.assertIn("mv -f /etc/ld.so.preload.bak-1a2b3c4d /etc/ld.so.preload", lines[1])
+        self.assertIn("\"$(cat /etc/ld.so.preload 2>/dev/null)\" = '/etc/pwn.so'", lines[1])
+        self.assertNotEqual(lines[1], "rm -f /etc/ld.so.preload")
+
+    def test_smb_read_file_missing_maps_to_none_when_authenticated(self):
+        with patch.object(tool.os, "name", "nt"), \
+             patch.object(tool.subprocess, "run") as run, \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            run.return_value.returncode = 0
+            self.assertIsNone(tool._smb_read_file(r"\\nas\etc-1", "ld.so.preload", "pw"))
+        self.assertEqual(run.call_count, 2)
+
+    def test_smb_read_file_returns_bytes_on_direct_hit(self):
+        with patch.object(tool.os, "name", "nt"), \
+             patch.object(tool.subprocess, "run", side_effect=AssertionError("mount unexpected")), \
+             patch("builtins.open", mock_open(read_data=b"/vendor/preload.so\n")):
+            self.assertEqual(tool._smb_read_file(r"\\nas\etc-1", "ld.so.preload", "pw"),
+                             b"/vendor/preload.so\n")
+
+    def test_smb_read_file_rejects_unverified_absence(self):
+        with patch.object(tool.os, "name", "nt"), \
+             patch.object(tool.subprocess, "run") as run, \
+             patch("builtins.open", side_effect=FileNotFoundError):
+            run.return_value.returncode = 1219  # 挂载失败：不能把读失败当成文件不存在
+            with self.assertRaises(OSError):
+                tool._smb_read_file(r"\\nas\etc-1", "ld.so.preload", "pw")
 
 
 if __name__ == "__main__":

