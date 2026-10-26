@@ -113,6 +113,7 @@ class MotrixRestoreTests(unittest.TestCase):
         source = source.replace('HOME_DIR="/home/${USER_NAME}/plugin/motrix"', 'HOME_DIR="' + str(plugin_home) + '"')
         source = source.replace('/data/plugin', str(self.root / 'data/plugin'))
         source = source.replace('/data/docker/docker', str(self.bin / 'docker'))
+        source = source.replace('/run/lock', str(self.root / 'run/lock'))
         self.script = self.root / 'restore.sh'
         self.script.write_text(source)
 

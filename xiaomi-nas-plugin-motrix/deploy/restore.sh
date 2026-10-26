@@ -1,5 +1,17 @@
 #!/bin/sh
 set -eu
+# All plugins share .list and nginx configuration. Serialize only boot recovery.
+if [ "${MINAS_PLUGIN_RESTORE_LOCKED:-0}" != 1 ]; then
+    exec python3 - "$0" "$@" <<'PYLOCK'
+import fcntl, os, subprocess, sys
+os.makedirs("/run/lock", exist_ok=True)
+with open("/run/lock/minas-plugin-restore.lock", "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    result = subprocess.run(["/bin/sh", *sys.argv[1:]],
+                            env=dict(os.environ, MINAS_PLUGIN_RESTORE_LOCKED="1"))
+    sys.exit(result.returncode)
+PYLOCK
+fi
 UID_NUM="${1:?Usage: sh restore.sh <NAS_UID>}"
 USER_NAME="u${UID_NUM}"
 BACKUP=/data/backup/plugins/motrix

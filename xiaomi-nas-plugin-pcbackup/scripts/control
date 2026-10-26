@@ -13,9 +13,10 @@ if [ -z "$HOME_DIR" ]; then
   HOME_DIR="/home/${PLUG_USER}/plugin/${PLUGIN_NAME}"
 fi
 PLUG_USER="${PLUG_USER:-$(basename "$(dirname "$(dirname "$HOME_DIR")")")}"
-DATA_DIR="${HOME_DIR}/etc"
+DATA_DIR="/data/backup/plugins/pcbackup/state"
 
 _write_unit() {
+  mkdir -p "$LOGDIR"
   cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
 [Unit]
 Description=${PLUGIN_NAME} service (PC incremental backup)
@@ -40,6 +41,10 @@ UNIT
 }
 
 _start() {
+  if [ ! -d "$DATA_DIR" ]; then
+    _prepare_data || return $?
+    _write_unit || return $?
+  fi
   mkdir -p "$LOGDIR" "$DATA_DIR"
   if [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ]; then
     systemctl restart "${PLUGIN_NAME}.service"; return $?
@@ -55,10 +60,34 @@ _stop() {
   [ -f "$LOGDIR/server.pid" ] && { kill "$(cat "$LOGDIR/server.pid")" 2>/dev/null; rm -f "$LOGDIR/server.pid"; }
 }
 
+_prepare_data() {
+  [ -d "$DATA_DIR" ] && return 0
+  # Freeze the old writer before the one-time copy. Retain etc as the migration backup.
+  if [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ]; then
+    systemctl stop "${PLUGIN_NAME}.service" || return $?
+  fi
+  python3 - "${HOME_DIR}/etc" "$DATA_DIR" <<'PYDATA'
+import os, shutil, sys, tempfile
+source, target = sys.argv[1:3]
+parent = os.path.dirname(target)
+os.makedirs(parent, exist_ok=True)
+temporary = tempfile.mkdtemp(prefix=".state-migrate-", dir=parent)
+try:
+    if os.path.isdir(source):
+        shutil.copytree(source, temporary, symlinks=True, dirs_exist_ok=True)
+    os.rename(temporary, target)
+finally:
+    if os.path.isdir(temporary):
+        shutil.rmtree(temporary)
+PYDATA
+}
+
 case "$1" in
     preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
     postinstall)
+        _prepare_data || exit $?
         _write_unit
+        [ "${PLUG_SKIP_SERVICE_START:-0}" = 1 ] && exit 0
         _start; exit $? ;;
     enable|start)  _start; exit $? ;;
     disable|stop)
@@ -83,7 +112,9 @@ case "$1" in
         rm -rf "$LOGDIR"; exit 0 ;;
     preupgrade)  exit 0 ;;
     postupgrade)
+        _prepare_data || exit $?
         _write_unit
+        [ "${PLUG_SKIP_SERVICE_START:-0}" = 1 ] && exit 0
         _start; exit $? ;;
     *) exit 0 ;;
 esac

@@ -5,6 +5,7 @@ LOGDIR="/tmp/${PLUGIN_NAME}"
 PORT="${PLUG_PORT_ALLOC:-9301}"
 
 _write_unit() {
+  mkdir -p "$LOGDIR"
   cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
 [Unit]
 Description=${PLUGIN_NAME} service (system monitor)
@@ -45,6 +46,7 @@ case "$1" in
     preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
     postinstall)
         _write_unit
+        [ "${PLUG_SKIP_SERVICE_START:-0}" = 1 ] && exit 0
         _start; exit $? ;;
     enable|start)  _start; exit $? ;;
     disable|stop)

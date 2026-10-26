@@ -65,6 +65,10 @@ python -X utf8 -m unittest discover -s tests -p 'test_deploy*.py' -v
 
 2026-10-26：新增 12 项回归在 Windows/WSL 通过，Linux/WSL 全部部署相关回归共 40 项通过。本次未执行 NAS 部署或真机任务验证。
 
+持久化恢复回归：`python -X utf8 -m unittest discover -s tests -p test_plugin_persistence.py -v`。Shell 用例需在 Linux/WSL 运行，使用临时文件系统和命令替身，不访问 NAS。覆盖恢复服务与业务服务的启动顺序、PC 任务与断点迁移及保留、四插件同时恢复与失败重试。运行状态的迁移在将来实际更新时执行，本地测试不会改动 NAS 现有任务或备份数据。
+
+本次新增 10 项持久化回归已在 Linux/WSL 通过，其中 5 万文件计划在恢复后由新后端进程读取并通过续传核对。PC 备份后端与前端上传代码未改动，继续保持上传 6 并发、目录准备 2 批并发；本次未部署、未做实机重启验证。
+
 ## 部署后的插件自愈（重要前置）
 
 插件会被"打开应用市场"触发的 `plugincenter update` 对账清除（不在云端 server.list 的判"已下架"删除）。若 NAS 上已部署自愈机制（server.list 条目缓存 + 定时 cron 脚本，原理见工具包内《技术复盘.md》"运行期防删除"一节），无需额外操作；全新机器首次部署后需按同原理初始化自愈，否则打开应用市场即丢插件。

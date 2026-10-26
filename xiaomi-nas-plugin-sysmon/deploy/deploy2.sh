@@ -37,84 +37,8 @@ cp -a "${SRC_ROOT}/INFO" "${HOME_DIR}/INFO"
 rm -rf "${HOME_DIR}/src/files" "${HOME_DIR}/src/ui"
 cp -a "${SRC_ROOT}/files" "${SRC_ROOT}/ui" "${HOME_DIR}/src/"
 chmod +x "${HOME_DIR}/src/files/server.sh" "${HOME_DIR}/src/ui/${PLUGIN}.cgi"
-# 生成真机 action 名的 control（旧版脚本用的是已被证伪的 action 名）
-cat > "${HOME_DIR}/scripts/control" <<'CTL'
-#!/bin/sh
-PLUGIN_NAME="sysmon"
-HTTPD="$PLUG_SRC_DIR/files/httpd.py"
-LOGDIR="/tmp/${PLUGIN_NAME}"
-PORT="${PLUG_PORT_ALLOC:-9301}"
-
-_write_unit() {
-  cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
-[Unit]
-Description=${PLUGIN_NAME} service (system monitor)
-After=network.target
-
-[Service]
-Type=simple
-ExecStart=/usr/bin/python3 ${HTTPD}
-Restart=on-failure
-RestartSec=5
-Environment=PLUG_PORT=${PORT}
-StandardOutput=append:${LOGDIR}/server.log
-StandardError=append:${LOGDIR}/server.log
-
-[Install]
-WantedBy=multi-user.target
-UNIT
-  systemctl daemon-reload
-  systemctl enable "${PLUGIN_NAME}.service" 2>/dev/null
-}
-
-_start() {
-  mkdir -p "$LOGDIR"
-  if [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ]; then
-    systemctl restart "${PLUGIN_NAME}.service"; return $?
-  fi
-  PLUG_PORT="$PORT" nohup /usr/bin/python3 "$HTTPD" >>"$LOGDIR/server.log" 2>&1 &
-  echo $! > "$LOGDIR/server.pid"
-}
-
-_stop() {
-  [ -f "/etc/systemd/system/${PLUGIN_NAME}.service" ] && \
-    systemctl stop "${PLUGIN_NAME}.service" 2>/dev/null
-  [ -f "$LOGDIR/server.pid" ] && { kill "$(cat "$LOGDIR/server.pid")" 2>/dev/null; rm -f "$LOGDIR/server.pid"; }
-}
-
-case "$1" in
-    preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
-    postinstall)
-        _write_unit
-        _start; exit $? ;;
-    enable|start)  _start; exit $? ;;
-    disable|stop)
-        [ "$PLUG_ACTION" = "uninstall" ] && {
-            systemctl disable "${PLUGIN_NAME}.service" 2>/dev/null
-            rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
-            systemctl daemon-reload 2>/dev/null
-        }
-        _stop; exit 0 ;;
-    status)
-        if systemctl is-active --quiet "${PLUGIN_NAME}.service" 2>/dev/null; then
-            echo "running"; exit 0
-        fi
-        if [ -f "$LOGDIR/server.pid" ] && kill -0 "$(cat "$LOGDIR/server.pid")" 2>/dev/null; then
-            echo "running"; exit 0
-        fi
-        echo "stopped"; exit 1 ;;
-    preuninstall)  _stop; exit 0 ;;
-    postuninstall)
-        rm -f "/etc/systemd/system/${PLUGIN_NAME}.service"
-        systemctl daemon-reload 2>/dev/null
-        rm -rf "$LOGDIR"; exit 0 ;;
-    preupgrade)  exit 0 ;;
-    postupgrade)
-        _write_unit
-        _start; exit $? ;;
-    *) exit 0 ;;
-esac
-CTL
+# Use the packaged lifecycle script so deploy and boot recovery use the same code.
+cp -a "${SRC_ROOT}/scripts/control" "${HOME_DIR}/scripts/control"
 chmod +x "${HOME_DIR}/scripts/control"
 chown -R "${USER_NAME}:${USER_NAME}" "${HOME_DIR}" 2>/dev/null || true
 
@@ -236,6 +160,19 @@ cp -a "${HOME_DIR}" "${BACKUP_DIR}/${PLUGIN}"
 echo "  ③ 安装开机自愈服务 ${PLUGIN}-restore.service"
 cat > "${BACKUP_DIR}/restore.sh" <<'RST'
 #!/bin/sh
+set -e
+# All plugins share .list and nginx configuration. Serialize only boot recovery.
+if [ "${MINAS_PLUGIN_RESTORE_LOCKED:-0}" != 1 ]; then
+    exec python3 - "$0" "$@" <<'PYLOCK'
+import fcntl, os, subprocess, sys
+os.makedirs("/run/lock", exist_ok=True)
+with open("/run/lock/minas-plugin-restore.lock", "a") as lock:
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    result = subprocess.run(["/bin/sh", *sys.argv[1:]],
+                            env=dict(os.environ, MINAS_PLUGIN_RESTORE_LOCKED="1"))
+    sys.exit(result.returncode)
+PYLOCK
+fi
 # sysmon 开机自愈：系统重启会清掉手动插件目录与 .list，从 /data 备份恢复
 UID_N=__NAS_UID__
 PLUGIN=sysmon
@@ -278,7 +215,7 @@ PY2
 fi
 
 if [ -f "${HOME_DIR}/scripts/control" ]; then
-    PLUG_SRC_DIR="${HOME_DIR}/src" PLUG_HOME_DIR="${HOME_DIR}" PLUG_USER="${USER_NAME}" \
+    PLUG_SKIP_SERVICE_START=1 PLUG_SRC_DIR="${HOME_DIR}/src" PLUG_HOME_DIR="${HOME_DIR}" PLUG_USER="${USER_NAME}" \
       PLUG_PORT_ALLOC="${PORT}" sh "${HOME_DIR}/scripts/control" postinstall
 fi
 
@@ -317,6 +254,7 @@ print("restore: nginx location 已注入")
 PY3
     nginx -t && nginx -s reload || echo "restore: nginx reload 失败（稍后可手动 reload）"
 fi
+systemctl --no-block start "${PLUGIN}.service"
 exit 0
 RST
 sed -i "s/^UID_N=__NAS_UID__$/UID_N=${UID_NUM}/" "${BACKUP_DIR}/restore.sh"

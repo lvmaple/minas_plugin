@@ -32,6 +32,7 @@ _stop() {
 case "$1" in
     preinstall)  mkdir -p "$LOGDIR"; exit 0 ;;
     postinstall)
+        mkdir -p "$LOGDIR"
         # Redirect inside ExecStart (sh -c) instead of StandardOutput=append:,
         # which needs systemd >= 240.
         cat > "/etc/systemd/system/${PLUGIN_NAME}.service" <<UNIT
@@ -51,6 +52,7 @@ WantedBy=multi-user.target
 UNIT
         systemctl daemon-reload
         systemctl enable "${PLUGIN_NAME}.service"
+        [ "${PLUG_SKIP_SERVICE_START:-0}" = 1 ] && exit 0
         _start; exit $? ;;
     enable|start)  _start; exit $? ;;
     restart)  _stop; _start; exit $? ;;
