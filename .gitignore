@@ -19,6 +19,10 @@ xiaomi-nas-plugin-pcbackup/tools/dev_data*/
 # NAS root 研究全集：整目录不入库（内部档案含设备/凭据信息；发布物在 xiaomi-nas-root-tool-1.0.9.462/）
 /nas-root-research/
 
+# 内部持久化变体：仅本地留存（含设备信息与内部实录，不入库）
+/xiaomi-nas-root-tool-1.0.9.462/persistent/
+
 # 本地代码审查报告（不入库）
 代码审查-*.md
 
+/docs-local/
