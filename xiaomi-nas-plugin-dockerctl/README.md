@@ -72,6 +72,6 @@ PLUG_PORT=9302 DOCKER_BIN=$(which docker) python3 httpd.py
 - **前端**：原生 HTML/CSS/JS，响应式，桌面端 Electron 兼容
 - **Docker**：通过 CLI 调用（适配小米 NAS `/data/docker/docker`）
 
-## License
+## 许可
 
-仅供学习参考。
+本插件的原创代码、脚本和文档按仓库的 [非商业许可](../LICENSE) 授权。允许非商业使用、修改和再分发，无须公开对应源码。Docker 标志及包含该标志的插件图标不在本许可范围内。
