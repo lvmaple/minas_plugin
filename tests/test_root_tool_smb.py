@@ -30,7 +30,7 @@ def account(id, username="original-user", status="1"):
 
 
 class SetupComplete(Exception):
-    """Stop main immediately after SMB setup, before key/payload generation."""
+    """Stop main immediately after SMB setup, before preload handling."""
 
 
 class OfflineNas:
@@ -97,6 +97,13 @@ class OfflineNas:
                 if self.persist_set:
                     self.accounts[id].update(copy.deepcopy(body))
                 result = {"code": 0}
+        elif operation == "del_samba_account":
+            id = str(body["id"])
+            if id not in self.accounts:
+                result = {"code": 2511}
+            else:
+                del self.accounts[id]
+                result = {"code": 0}
         else:
             raise AssertionError("Unexpected API: " + operation)
         return self.reply(self.responses.get(operation, result))
@@ -116,7 +123,11 @@ class RootToolSmbTests(unittest.TestCase):
         output = io.StringIO()
         with patch.object(tool, "Nas", return_value=nas), \
              patch.object(tool, "find_cert_dir", return_value="offline-certs"), \
-             patch.object(tool, "ssh_key_path", side_effect=SetupComplete), \
+             patch.object(tool, "ssh_key_path", return_value="offline-key"), \
+             patch.object(tool, "build_trigger_so"), \
+             patch.object(tool.os.path, "getsize", return_value=0), \
+             patch.object(tool, "_smb_read_file", side_effect=SetupComplete), \
+             patch("builtins.open", mock_open(read_data="offline-public-key")), \
              patch.object(tool, "_cleanup_via_shell") as cleanup, \
              patch.object(tool.time, "sleep"), \
              patch.object(tool.socket, "create_connection", side_effect=AssertionError("Network forbidden")), \
@@ -277,6 +288,25 @@ class RootToolSmbTests(unittest.TestCase):
         self.assertFalse(self.run_setup(nas, "--uid", "20002")[0])
         self.assertEqual(nas.writes, [])
         self.assertEqual(nas.webdav_calls, [])
+
+    def test_preflight_failure_precedes_any_share_creation(self):
+        # keystone/ssh-keygen 预检失败必须在步骤②创建共享之前终止：
+        # 此前 keystone 缺失在共享建成后才 die，不交代口令也不清理
+        nas = OfflineNas()
+        with patch.object(tool, "Nas", return_value=nas), \
+             patch.object(tool, "find_cert_dir", return_value="offline-certs"), \
+             patch.object(tool, "ssh_key_path", return_value="offline-key"), \
+             patch("builtins.open", mock_open(read_data="offline-public-key")), \
+             patch.object(tool, "build_trigger_so", side_effect=SystemExit(1)), \
+             patch.object(tool.socket, "create_connection", side_effect=AssertionError("Network forbidden")), \
+             patch.object(tool.subprocess, "run", side_effect=AssertionError("Subprocess forbidden")), \
+             patch("sys.argv", [str(SCRIPT), nas.ip]), redirect_stdout(io.StringIO()):
+            with self.assertRaises(SystemExit) as caught:
+                tool.main()
+        self.assertEqual(caught.exception.code, 1)
+        self.assertEqual(nas.calls, [])
+        self.assertEqual(nas.webdav_calls, [])
+        self.assertEqual(nas.writes, [])
 
     def test_main_passes_actual_id_to_cleanup_and_uses_repaired_share_name(self):
         for originals, expected_id in (([], "1"), ([account(1)], "2")):
@@ -657,12 +687,120 @@ class PayloadAndReadHelperTests(unittest.TestCase):
                              b"/vendor/preload.so\n")
 
     def test_smb_read_file_rejects_unverified_absence(self):
+        result = subprocess.CompletedProcess([], 1219, stdout=b"", stderr=b"conflict")
         with patch.object(tool.os, "name", "nt"), \
-             patch.object(tool.subprocess, "run") as run, \
+             patch.object(tool.subprocess, "run", return_value=result), \
              patch("builtins.open", side_effect=FileNotFoundError):
-            run.return_value.returncode = 1219  # 挂载失败：不能把读失败当成文件不存在
-            with self.assertRaises(OSError):
+            with self.assertRaises(OSError) as caught:
                 tool._smb_read_file(r"\\nas\etc-1", "ld.so.preload", "pw")
+        self.assertIn("rc=1219", str(caught.exception))
+
+    def test_net_use_mount_reports_failure_with_details(self):
+        # 真实 subprocess.run（无 text=True）返回 bytes；曾因 bytes+str 拼接
+        # 抛 TypeError 且不被 except OSError 捕获，失败信息与口令交代全部丢失。
+        result = subprocess.CompletedProcess(
+            [], 1219, stdout=b"",
+            stderr=("System error 1219 has occurred.\r\n"
+                    "Multiple connections to a server or shared resource by the same user..."
+                    ).encode("mbcs" if os.name == "nt" else "utf-8"))
+        with patch.object(tool.os, "name", "nt"), \
+             patch.object(tool.subprocess, "run", return_value=result):
+            with self.assertRaises(OSError) as caught:
+                tool._net_use_mount(r"\\nas\etc-1", "pw")
+        message = str(caught.exception)
+        self.assertIn("rc=1219", message)
+        self.assertIn("System error 1219 has occurred.", message)
+
+    def test_net_use_mount_retries_transient_errors(self):
+        transient = subprocess.CompletedProcess([], 67, stdout=b"", stderr=b"share not found")
+        ok = subprocess.CompletedProcess([], 0, stdout=b"", stderr=b"")
+        with patch.object(tool.os, "name", "nt"), \
+             patch.object(tool.time, "sleep") as sleep, \
+             patch.object(tool.subprocess, "run", side_effect=[transient, transient, ok]):
+            mounted = tool._net_use_mount(r"\\nas\etc-1", "pw")
+        self.assertEqual(mounted.returncode, 0)
+        self.assertEqual(sleep.call_count, 2)
+
+    def test_net_use_mount_timeout_maps_to_oserror(self):
+        # TimeoutExpired 不是 OSError：不转换会穿过 main 的 except OSError 裸崩
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        with patch.object(tool.os, "name", "nt"), \
+             patch.object(tool.subprocess, "run", side_effect=hang):
+            with self.assertRaises(OSError) as caught:
+                tool._net_use_mount(r"\\nas\etc-1", "pw")
+        self.assertIn("超时", str(caught.exception))
+
+    def test_smb_read_file_delete_timeout_does_not_mask_success(self):
+        # 挂载与读取均已成功时，finally 里 net use /delete 超时不能把结果顶成崩溃
+        def run(cmd, **kw):
+            if "/delete" in cmd:
+                raise subprocess.TimeoutExpired(cmd, 30)
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+        with patch.object(tool.os, "name", "nt"), \
+             patch.object(tool.subprocess, "run", side_effect=run), \
+             patch("builtins.open",
+                   side_effect=[PermissionError(13, "denied"), io.BytesIO(b"/vendor/preload.so\n")]):
+            self.assertEqual(tool._smb_read_file(r"\\nas\etc-1", "ld.so.preload", "pw"),
+                             b"/vendor/preload.so\n")
+
+    def test_posix_mount_timeout_maps_to_oserror(self):
+        def hang(cmd, **kw):
+            raise subprocess.TimeoutExpired(cmd, 30)
+
+        with patch.object(tool.os, "name", "posix"), \
+             patch("tempfile.mkdtemp", return_value="mnt-x"), \
+             patch.object(tool.os, "rmdir") as rmdir, \
+             patch.object(tool.subprocess, "run", side_effect=hang):
+            with self.assertRaises(OSError) as caught:
+                tool._smb_read_file(r"\\nas\etc-1", "ld.so.preload", "pw")
+        self.assertIn("超时", str(caught.exception))
+        rmdir.assert_called_once_with("mnt-x")
+
+    def test_posix_umount_failure_does_not_mask_read(self):
+        def run(cmd, **kw):
+            if cmd[0] == "umount":
+                raise subprocess.TimeoutExpired(cmd, 30)
+            return subprocess.CompletedProcess(cmd, 0, stdout=b"", stderr=b"")
+
+        with patch.object(tool.os, "name", "posix"), \
+             patch("tempfile.mkdtemp", return_value="mnt-x"), \
+             patch.object(tool.os, "rmdir"), \
+             patch.object(tool.subprocess, "run", side_effect=run), \
+             patch("builtins.open", mock_open(read_data=b"/vendor/preload.so\n")):
+            self.assertEqual(tool._smb_read_file(r"\\nas\etc-1", "ld.so.preload", "pw"),
+                             b"/vendor/preload.so\n")
+
+
+class CleanupLeftoverTests(unittest.TestCase):
+    def run_cleanup_mode(self, nas):
+        output = io.StringIO()
+        with patch.object(tool, "Nas", return_value=nas), \
+             patch.object(tool, "find_cert_dir", return_value="offline-certs"), \
+             patch.object(tool.socket, "create_connection", side_effect=AssertionError("Network forbidden")), \
+             patch.object(tool.subprocess, "run", side_effect=AssertionError("Subprocess forbidden")), \
+             patch("sys.argv", [str(SCRIPT), nas.ip, "--cleanup"]), redirect_stdout(output):
+            tool.main()
+        return output.getvalue()
+
+    def test_cleanup_removes_only_tool_shaped_leftover(self):
+        nas = OfflineNas([account(1, USER), {"id": "2", "status": "1", "username": USER,
+                                             "password": "temp-pw", "share_dir": ["/etc"]}])
+        output = self.run_cleanup_mode(nas)
+        self.assertIn("已删除临时 SMB 账号", output)
+        self.assertEqual([op for op, _ in nas.calls if op == "del_samba_account"],
+                         ["del_samba_account"])
+        self.assertEqual(nas.calls[-1][1], {"id": 2})
+        self.assertEqual(list(nas.accounts), ["1"])
+
+    def test_cleanup_preserves_non_tool_accounts(self):
+        nas = OfflineNas([account(1, USER), account(2, "other-user")])
+        output = self.run_cleanup_mode(nas)
+        self.assertIn("无需清理", output)
+        self.assertNotIn("del_samba_account", [op for op, _ in nas.calls])
+        self.assertEqual(len(nas.accounts), 2)
 
 
 if __name__ == "__main__":

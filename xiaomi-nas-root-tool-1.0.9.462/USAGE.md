@@ -15,7 +15,39 @@ python xiaomi-nas-root.py <NAS_IP>
 #   --uid <米家数字UID>         指定米家数字 UID（默认从证书解析）
 #   --cert-dir <路径>          指定证书目录（默认自动搜索 minasCert）
 #   --shell-port 2323          root shell 端口
+#   --cleanup                  只删除本 UID 遗留的临时 SMB 账号（/etc 共享），不尝试获取 root
 ```
+
+## 常见故障
+
+**步骤③ 读 `\\<NAS_IP>\etc-<uid>\ld.so.preload` 失败（Errno 22 / Errno 13）**：这两个 errno 来自
+Windows SMB 客户端会话层，不是共享不存在（那会是 Errno 2）。最常见原因是**同一 NAS 已存在其他
+凭据的 SMB 会话**（如桌面端映射的 Z: 网络盘）——Windows 不允许对同一服务器用两套凭据建立会话
+（`net use` 错误 1219）。处置：
+
+```powershell
+net use                  # 查看现有连接
+net use Z: /delete       # 断开到该 NAS 的既有映射（或对应 UNC 连接）后重跑
+```
+
+较新版本会在失败信息里直接给出 rc=1219 与上述提示；遇到 53/67/121 会自动短重试。**不需要**
+手动 `smb_mgr.sh restart` 或等待：`set_samba_account` 返回 0 时固件已在服务端同步完成
+init_config + restart，共享立即生效（读回核验通过即证明配置落地）。
+
+挂载或收尾（`net use /delete`）超时会转为明确的 `OSError` 报错，不再以未处理异常退出——
+任何 SMB 失败路径都会先在控制台交代本次临时账号口令并尝试清理。ssh 密钥、keystone-engine
+与触发 .so 的本地预检在 NAS 端任何变更之前完成：依赖缺失会立即以安装指引终止，不会先建好
+临时账号再失败。
+
+**遗留临时账号的清理**（不需要 root、不需要恢复出厂）：
+
+```powershell
+python xiaomi-nas-root.py <NAS_IP> --cleanup
+```
+
+经证书调 `del_samba_account`，只删除本 UID 名下、共享路径恰为 `/etc` 的记录（本工具唯一的
+创建形态）；固件会同步删除 pdbedit 账号、`sambau<uid>` 系统用户、uci 配置与注入共享并重启
+smbd。也可以直接在小米 App/网页端 SMB 账号管理里删除 `u<uid>` 账号（效果等同）。
 
 ## 敏感信息处理
 
@@ -33,7 +65,7 @@ python xiaomi-nas-root.py <NAS_IP>
 
 ## 产物
 
-- **root shell**：`nc <IP> 2323`（或 `wsl bash -c 'nc <IP> 2323'`）
+- **root shell**：`nc <IP> 2323`（或 `wsl bash -c 'nc <IP> 2323'`；自动清理不依赖 nc/WSL——脚本用原生 socket 直连该端口）
 - **SSH 22**：`ssh -i ~/.ssh/id_ed25519_minas root@<IP>`（公钥注入；注意本固件 dropbear 有 exec bug——认证可用但命令无输出）
 
 **不做持久化**：本脚本只获取本机会话——无挂载钩子、无开机自启。设备重启后 **socat root shell 与 dropbear 服务消失**，需要时重新运行即可（全程约 2 分钟）；**有意保留**：两处 SSH 公钥（`/etc/dropbear/authorized_keys`、`/home/rootx/.ssh/authorized_keys`）与 passwd 中 root home 修改——密钥认证重启后仍可用，如需彻底清除请删除这两个文件并把 home 改回 `/root`。是否及如何做持久化由使用者自行决定，不属于本脚本范围。
@@ -42,7 +74,7 @@ python xiaomi-nas-root.py <NAS_IP>
 
 覆盖 `/etc/ld.so.preload` 前先经共享读回原文件：读取失败（原状未确认）直接中止布防；非空则备份为 `/etc/ld.so.preload.bak-<随机>` 并读回校验。触发 payload 的首行与清理命令都优先恢复备份原文件；仅当当前内容仍是本工具的布防标记（`/etc/pwn.so`）时才删除 preload，已恢复的原文件不会被误删（并发触发与清理竞态下安全）。原本无 preload 时维持旧行为：清理即删除。
 
-进入触发阶段后，成功与失败路径都会尝试清理（经 root shell）：按上述状态恢复/移除 preload、清除 payload 文件，并只清除本次新建且仍符合归属检查的 SMB 记录、临时目录和精确匹配的 samba 系统账号行。清理使用读回确认的实际 ID，核对账号、口令指纹、路径、启停状态和共享属性；记录发生变化时输出 `SMB_CLEAN_SKIP`，保留配置，不误报清理成功。root shell 不可达或清理未确认成功时，把带归属检查的完整命令写入本地 `cleanup-<IP>.sh`，并打印手动提示；命令不包含临时 SMB 明文口令。
+进入触发阶段后，成功与失败路径都会尝试清理（经 root shell，Windows 上原生 socket 直连 2323 端口，**不依赖 WSL/nc**）：按上述状态恢复/移除 preload、清除 payload 文件，并只清除本次新建且仍符合归属检查的 SMB 记录、临时目录和精确匹配的 samba 系统账号行。清理使用读回确认的实际 ID，核对账号、口令指纹、路径、启停状态和共享属性；记录发生变化时输出 `SMB_CLEAN_SKIP`，保留配置，不误报清理成功。root shell 不可达或清理未确认成功时，把带归属检查的完整命令写入本地 `cleanup-<IP>.sh`，并打印手动提示；命令不包含临时 SMB 明文口令。**步骤②/③任何失败路径都会在控制台交代本次临时账号口令**，root shell 不可用时也可用 `--cleanup` 或 App 的 SMB 账号管理删除账号。
 
 SMB 新增或设置阶段若发生错误、响应不完整或读回不一致，立即停止，不猜测 ID，不自动覆盖或删除记录。暂存目录创建（MKCOL 201）之后的失败不再无声遗留：仅建目录时精确删除该随机目录；临时账号已提交（注入共享随之生效）时输出以口令指纹锚定的清理命令（不核对状态未知的共享 path/name），并在控制台交代本次临时口令；root shell 不可用时命令落入 `cleanup-<IP>.sh`，也可直接在小米 App/网页端的 SMB 账号管理中删除 `u<uid>` 账号。固件没有提供“仅当配置未变时写入”的原子接口，运行期间请勿同时在客户端修改 SMB 配置；预检和读回不能替代服务端的并发控制。
 
